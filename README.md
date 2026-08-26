@@ -4,7 +4,22 @@ Transcripción local de reuniones con Faster-Whisper y guardado de notas en Obsi
 
 ## Ejecución en macOS
 
-El lanzador `start_transcribe.sh` abre Terminal, activa el entorno virtual y ejecuta el transcriptor.
+La ruta de Obsidian y el modelo de Whisper se configuran mediante variables de
+entorno. Copia `.env.example` a `.env` y ajusta sus valores:
+
+```bash
+cp .env.example .env
+```
+
+Ejemplo:
+
+```env
+OBSIDIAN_DIR=/Users/TU_USUARIO/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian
+WHISPER_MODEL=medium
+```
+
+`WHISPER_MODEL` puede ser `medium`, `small` o `tiny`. `medium` es el valor
+predeterminado y prioriza la precisión.
 
 Para ejecutar manualmente:
 
@@ -15,4 +30,5 @@ python -m pip install -r requirements.txt
 python meeting_transcriber.py
 ```
 
-La ruta de Obsidian se configura actualmente en `meeting_transcriber.py` y debe adaptarse por equipo.
+Si no defines `OBSIDIAN_DIR`, macOS usa la ruta de iCloud de Obsidian y Windows
+usa `~/Documents/Obsidian`.

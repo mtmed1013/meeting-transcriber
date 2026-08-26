@@ -6,18 +6,29 @@ import numpy as np
 import sounddevice as sd
 from datetime import datetime
 from faster_whisper import WhisperModel
+from dotenv import load_dotenv
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 import librosa
 
 # ================= CONFIG =================
 
-OBSIDIAN_DIR = "/Users/mateoarteaga/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian"
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(PROJECT_DIR, ".env"))
+
+DEFAULT_OBSIDIAN_DIR = (
+    os.path.expanduser("~/Documents/Obsidian")
+    if os.name == "nt"
+    else os.path.expanduser(
+        "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian"
+    )
+)
+OBSIDIAN_DIR = os.environ.get("OBSIDIAN_DIR", "").strip() or DEFAULT_OBSIDIAN_DIR
 NOTE_TITLE = f"Reunión - {datetime.now().strftime('%Y-%m-%d %H-%M')}.md"
 
 SAMPLE_RATE = 16000
 BLOCK_SECONDS = 30  # cada cuántos segundos se transcribe
-WHISPER_MODEL = "medium"  # perfecto para reuniones
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "").strip() or "medium"
 last_voice_signature = None
 
 # ==========================================
@@ -120,6 +131,7 @@ def transcriber_loop(file_path):
             flush_buffer(buffer, file_path)
 
 def main():
+    os.makedirs(OBSIDIAN_DIR, exist_ok=True)
     file_path = os.path.join(OBSIDIAN_DIR, NOTE_TITLE)
     write_header(file_path)
 
