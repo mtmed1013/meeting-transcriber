@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Entornos virtuales y caches locales
+venv/
+.venv/
+venv-*/
+.cache/
+
+# Modelos y salidas locales
+models/
+outputs/
+*.wav
+*.mp3
+*.m4a
+
+# Configuración local
+.env
+.env.*
+!.env.example

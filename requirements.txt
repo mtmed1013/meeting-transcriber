@@ -1,0 +1,4 @@
+faster-whisper==1.2.1
+librosa==0.11.0
+numpy>=2.0,<3
+sounddevice==0.5.3
