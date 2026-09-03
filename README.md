@@ -46,4 +46,7 @@ Descarga el proyecto en el equipo Windows y haz doble clic en
 
 Después de instalar, inicia una reunión haciendo doble clic en
 `start_transcribe.bat`. Puedes cambiar `OBSIDIAN_DIR` y `WHISPER_MODEL` en
-`.env` antes de iniciar.
+`.env` antes de iniciar. En Windows, la aplicación combina el micrófono físico
+con el loopback WASAPI del altavoz predeterminado para recibir tu voz y el
+audio de Teams. Si necesitas seleccionar dispositivos concretos, usa
+`WINDOWS_MICROPHONE` y `WINDOWS_SPEAKER` con parte de sus nombres.
