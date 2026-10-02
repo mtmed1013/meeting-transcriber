@@ -117,6 +117,34 @@ dispositivos concretos, usa
 
 ### Windows 11 y sesiones RDP / Windows App
 
+Windows usa `WINDOWS_WHISPER_MODEL=small` por defecto; macOS conserva
+`WHISPER_MODEL=medium`. Para mantener medium en Windows, define
+`WINDOWS_WHISPER_MODEL=medium`. Esta variable Windows tiene prioridad sobre
+`WHISPER_MODEL`, incluso en un `.env` existente. El instalador preserva ese
+archivo y descarga el modelo Windows seleccionado. La primera ejecución con
+small puede tardar en descargarlo si no está en caché.
+
+`WHISPER_LANGUAGE=es` fija español como idioma principal en ambos sistemas;
+acepta vocabulario inglés, pero no garantiza su transcripción exacta. Usa
+`WHISPER_LANGUAGE=auto` si necesitas detección de idioma. Los marcadores
+experimentales de hablante están desactivados; `SPEAKER_MARKERS=true` los activa.
+La captura nativa de macOS no cambia.
+
+Para comprobar las fuentes en Windows sin cargar Whisper:
+
+```powershell
+.\venv\Scripts\python.exe windows_audio.py --check
+```
+
+Habla durante los primeros 15 segundos y reproduce una frase desde Windows
+durante los siguientes 15. Comprueba los picos por fuente; muestras recibidas no
+significan necesariamente sonido audible. La prueba no genera archivos de audio.
+
+La cola conserva el tiempo estimado del audio para las horas de la nota. El reloj
+de muestras no puede adelantarse indefinidamente al reloj real: se regula la
+lectura de dispositivos virtuales y se limita el tramo final. Durante el cierre
+se muestra una estimación basada en la velocidad medida, no un tiempo garantizado.
+
 La captura usa un hilo por fuente, con COM inicializado en cada hilo, WASAPI en
 modo compartido, lecturas de 50 ms y un búfer solicitado de un segundo. Una fuente
 retrasada no bloquea a la otra. El loopback se selecciona por el ID del altavoz,

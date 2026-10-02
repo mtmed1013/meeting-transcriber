@@ -74,7 +74,7 @@ def capture(output_queue, stop_event, error_queue, rate=16000,
     labels = {"microphone": "micrófono", "system": "loopback"}
     state_lock = threading.Lock()
     states = {source: {"last": time.monotonic(), "level": None, "gaps": 0,
-                       "active": False} for source in labels}
+                       "active": False, "frames": 0, "peak": 0.0} for source in labels}
     original_warning = warnings.showwarning
 
     def report_warning(message, category, filename, lineno, file=None, line=None):
@@ -112,9 +112,14 @@ def capture(output_queue, stop_event, error_queue, rate=16000,
                                         cursor = now - len(samples) / rate
                                     packets.put((source, cursor, samples.copy()))
                                     cursor += len(samples) / rate
+                                    # Some virtual endpoints deliver synthetic silence quickly.
+                                    # Do not let sample count run minutes ahead of wall time.
+                                    stop_event.wait(max(0, cursor - time.monotonic()))
                                     with state_lock:
                                         states[source].update(last=now, active=True,
                                             level=float(np.sqrt(np.mean(samples ** 2))))
+                                        states[source]["frames"] += len(samples)
+                                        states[source]["peak"] = max(states[source]["peak"], float(np.max(np.abs(samples))))
                                     if first:
                                         print(f"✅ Recibiendo audio de {labels[source]} (puede ser silencio)")
                                         first = False
@@ -155,7 +160,7 @@ def capture(output_queue, stop_event, error_queue, rate=16000,
             missing["microphone"] += frames - mic_count
             missing["system"] += frames - system_count
             if mic_count or system_count:
-                output_queue.put(((mic + system) * 0.5).reshape(-1, 1))
+                output_queue.put((next_start, ((mic + system) * 0.5).reshape(-1, 1)))
             next_start += step
 
     def drain():
@@ -181,13 +186,15 @@ def capture(output_queue, stop_event, error_queue, rate=16000,
                     snapshot = {source: dict(state) for source, state in states.items()}
                     for state in states.values():
                         state["gaps"] = 0
+                        state["peak"] = 0.0
                 for source, state in snapshot.items():
                     age = now - state["last"]
                     level = state["level"]
                     status = "sin muestras" if age > 3 else (
                         "silencio/nivel bajo" if level is None or level < 0.001 else "audio presente")
                     print(f"📊 {labels[source]}: {status}; discontinuidades={state['gaps']}; "
-                          f"huecos estimados={missing[source] / rate:.1f}s/15s")
+                          f"RMS={level or 0:.6f}; pico={state['peak']:.6f}; "
+                          f"recibido={state['frames'] / rate:.1f}s; huecos={missing[source] / rate:.1f}s/15s")
                     if age > 3 and state["active"]:
                         print(f"⚠️ {labels[source]} sin entregar datos; comprueba la conexión RDP")
                     missing[source] = 0
@@ -202,9 +209,39 @@ def capture(output_queue, stop_event, error_queue, rate=16000,
                 for start, samples in timeline.chunks]
         # Include a partial last window, padded with silence.
         if ends:
-            emit_until(max(ends) + step)
+            emit_until(min(max(ends), time.monotonic()) + step)
         for worker in workers:
             if worker.is_alive():
                 print(f"⚠️ {worker.name} sigue bloqueado en el controlador; guardando audio disponible")
         if warnings.showwarning is report_warning:
             warnings.showwarning = original_warning
+        with output_queue.mutex:
+            pending = sum(len(packet[1]) for packet in output_queue.queue) / rate
+        print(f"📊 Captura cerrada: audio pendiente en cola={pending:.1f}s")
+
+
+if __name__ == "__main__":
+    import os
+    import argparse
+    from dotenv import load_dotenv
+
+    parser = argparse.ArgumentParser(description="Prueba de fuentes WASAPI sin cargar Whisper")
+    parser.add_argument("--check", action="store_true", required=True)
+    parser.parse_args()
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+    print("Primeros 15s: habla por el micrófono. Siguientes 15s: reproduce una frase en Windows.")
+    print("Comprueba el pico de cada fuente. Esta prueba no guarda audio ni genera una nota.")
+    stop = threading.Event()
+    timer = threading.Timer(31, stop.set)
+    timer.start()
+    errors = queue.Queue()
+    try:
+        capture(queue.Queue(), stop, errors,
+                microphone_name=os.getenv("WINDOWS_MICROPHONE", ""),
+                speaker_name=os.getenv("WINDOWS_SPEAKER", ""))
+    except KeyboardInterrupt:
+        stop.set()
+    finally:
+        timer.cancel()
+    while not errors.empty():
+        print(f"❌ {errors.get()}")

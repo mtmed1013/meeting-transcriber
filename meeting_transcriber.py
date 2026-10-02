@@ -12,7 +12,7 @@ from collections import deque
 from contextlib import nullcontext
 import numpy as np
 import sounddevice as sd
-from datetime import datetime
+from datetime import datetime, timedelta
 from faster_whisper import WhisperModel
 from dotenv import load_dotenv
 import warnings
@@ -64,6 +64,11 @@ NOTE_TITLE = f"Reunión - {datetime.now().strftime('%Y-%m-%d %H-%M-%S')}-{uuid4(
 SAMPLE_RATE = 16000
 BLOCK_SECONDS = 30  # cada cuántos segundos se transcribe
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "").strip() or "medium"
+if os.name == "nt":
+    WHISPER_MODEL = os.environ.get("WINDOWS_WHISPER_MODEL", "").strip() or "small"
+WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "es").strip().lower() or "es"
+WHISPER_LANGUAGE = None if WHISPER_LANGUAGE == "auto" else WHISPER_LANGUAGE
+SPEAKER_MARKERS = _env_bool("SPEAKER_MARKERS", default=False)
 WHISPER_BEAM_SIZE = 5
 WHISPER_VAD_FILTER = _env_bool("WHISPER_VAD_FILTER", default=True)
 WINDOWS_MICROPHONE = os.environ.get("WINDOWS_MICROPHONE", "").strip()
@@ -131,12 +136,12 @@ def write_header(file_path):
         f.write(f"🕒 Inicio: {datetime.now().strftime('%H:%M')}\n\n")
         f.write("---\n\n")
 
-def append_text(file_path, text):
-    timestamp = datetime.now().strftime("%H:%M:%S")
+def append_text(file_path, text, audio_time=None):
+    timestamp = (audio_time or datetime.now()).strftime("%H:%M:%S")
     with open(file_path, "a", encoding="utf-8") as f:
         f.write(f"**[{timestamp}]**\n{text.strip()}\n\n")
 
-def flush_buffer(buffer, file_path):
+def flush_buffer(buffer, file_path, audio_time=None):
     if not buffer:
         return
 
@@ -149,7 +154,7 @@ def flush_buffer(buffer, file_path):
             return
         
     transcribe_options = dict(
-        language=None,
+        language=WHISPER_LANGUAGE,
         vad_filter=WHISPER_VAD_FILTER,
         beam_size=WHISPER_BEAM_SIZE,
     )
@@ -164,19 +169,18 @@ def flush_buffer(buffer, file_path):
     segments, info = model.transcribe(audio, **transcribe_options)
 
     text = " ".join(seg.text for seg in segments).strip()
-    sig = voice_signature(audio, SAMPLE_RATE)
-
-    if speaker_changed(sig):
-        append_text(file_path, "— 🔄 Cambio de hablante —")
+    if text and SPEAKER_MARKERS and speaker_changed(voice_signature(audio, SAMPLE_RATE)):
+        append_text(file_path, "— 🔄 Cambio de hablante estimado —", audio_time)
 
     if text:
-        append_text(file_path, text)
+        append_text(file_path, text, audio_time)
         print("📝 Texto guardado")
     else:
-        print("⚠️ Audio muy corto, sin texto detectado")
+        print("⚠️ Sin voz o texto detectado en este bloque")
     if os.name == "nt":
         with audio_queue.mutex:
-            pending = sum(len(chunk) for chunk in audio_queue.queue) / SAMPLE_RATE
+            pending = sum(len(chunk[1]) if isinstance(chunk, tuple) else len(chunk)
+                          for chunk in audio_queue.queue) / SAMPLE_RATE
         elapsed = time.monotonic() - started
         print(f"📊 Whisper: {elapsed:.1f}s de procesamiento; audio pendiente={pending:.1f}s")
         if elapsed > len(audio) / SAMPLE_RATE:
@@ -219,23 +223,45 @@ def windows_transcriber_loop(file_path, capture_done):
     buffer = []
     buffered = 0
     target = SAMPLE_RATE * BLOCK_SECONDS
+    audio_time = None
+    wall_origin = datetime.now()
+    mono_origin = time.monotonic()
+    processed = 0
+    processing_seconds = 0.0
     print(f"⏱️ Primer bloque: {BLOCK_SECONDS}s de audio recibido, más el tiempo de Whisper")
     while not (capture_done.is_set() and audio_queue.empty()):
         try:
             data = audio_queue.get(timeout=0.2)
         except queue.Empty:
             continue
+        if isinstance(data, tuple):
+            packet_start, data = data
+        else:
+            packet_start = time.monotonic() - len(data) / SAMPLE_RATE
         while len(data):
+            if audio_time is None:
+                audio_time = wall_origin + timedelta(seconds=packet_start - mono_origin)
             count = min(len(data), target - buffered)
             buffer.append(data[:count])
             buffered += count
             data = data[count:]
+            packet_start += count / SAMPLE_RATE
             if buffered == target:
-                flush_buffer(buffer, file_path)
+                started = time.monotonic()
+                flush_buffer(buffer, file_path, audio_time)
+                processing_seconds += time.monotonic() - started
+                processed += buffered
                 buffer.clear()
                 buffered = 0
+                audio_time = None
+                if capture_done.is_set():
+                    with audio_queue.mutex:
+                        pending = sum(len(x[1]) if isinstance(x, tuple) else len(x)
+                                      for x in audio_queue.queue) / SAMPLE_RATE
+                    estimate = pending * processing_seconds / (processed / SAMPLE_RATE)
+                    print(f"💾 Cierre: quedan {pending:.1f}s de audio; espera aproximada {estimate:.0f}s")
     if buffer:
-        flush_buffer(buffer, file_path)
+        flush_buffer(buffer, file_path, audio_time)
 
 
 def _mono_audio(data):

@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import types
+from datetime import datetime, timedelta
 import unittest
 from unittest.mock import patch
 
@@ -46,7 +47,7 @@ class WindowsAudioTests(unittest.TestCase):
                 pass
 
             def record(self, numframes):
-                time.sleep(0.05)
+                # Simulate a remote endpoint returning synthetic blocks instantly.
                 return np.ones((numframes, 2), dtype=np.float32)
 
         device = types.SimpleNamespace(id="speaker", name="Audio remoto", isloopback=True,
@@ -70,7 +71,8 @@ class WindowsAudioTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertTrue(errors.empty())
         self.assertGreater(output.qsize(), 0)
-        self.assertTrue(any(np.max(chunk) > 0 for chunk in list(output.queue)))
+        self.assertTrue(any(np.max(chunk[1]) > 0 for chunk in list(output.queue)))
+        self.assertLessEqual(sum(len(chunk[1]) for chunk in list(output.queue)), 1000)
 
     def test_fixed_batches_and_final_queue_are_consumed(self):
         # Extract only the loop: avoid loading/downloading Whisper during tests.
@@ -83,8 +85,9 @@ class WindowsAudioTests(unittest.TestCase):
         done = threading.Event()
         done.set()
         saved = []
-        namespace = dict(queue=queue, audio_queue=chunks, SAMPLE_RATE=1, BLOCK_SECONDS=10,
-                         flush_buffer=lambda buffer, path: saved.append(sum(len(x) for x in buffer)))
+        namespace = dict(queue=queue, time=time, datetime=datetime, timedelta=timedelta,
+                         audio_queue=chunks, SAMPLE_RATE=1, BLOCK_SECONDS=10,
+                         flush_buffer=lambda buffer, path, stamp=None: saved.append(sum(len(x) for x in buffer)))
         exec(compile(ast.Module(body=[function], type_ignores=[]), "loop", "exec"), namespace)
         with contextlib.redirect_stdout(io.StringIO()):
             namespace["windows_transcriber_loop"]("note", done)
@@ -131,7 +134,7 @@ class WindowsAudioTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertTrue(errors.empty())
         self.assertGreaterEqual(len(attempts), 2)
-        self.assertTrue(any(np.max(chunk) > 0.9 for chunk in list(output.queue)))
+        self.assertTrue(any(np.max(chunk[1]) > 0.9 for chunk in list(output.queue)))
 
 
 if __name__ == "__main__":

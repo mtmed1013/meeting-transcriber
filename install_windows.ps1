@@ -75,7 +75,7 @@ if (-not (Test-Path (Join-Path $ProjectDir ".env"))) {
 }
 
 Write-Host "Descargando y verificando el modelo Whisper..."
-& $VenvPython -c "from dotenv import load_dotenv; import os; from faster_whisper import WhisperModel; load_dotenv('.env'); name = os.getenv('WHISPER_MODEL', '').strip() or 'medium'; print(f'Modelo: {name}'); WhisperModel(name, device='cpu', compute_type='int8'); print('Modelo listo.')"
+& $VenvPython -c "from dotenv import load_dotenv; import os; from faster_whisper import WhisperModel; load_dotenv('.env'); name = os.getenv('WINDOWS_WHISPER_MODEL', '').strip() or 'small'; print(f'Modelo Windows: {name}'); WhisperModel(name, device='cpu', compute_type='int8'); print('Modelo listo.')"
 if ($LASTEXITCODE -ne 0) {
     throw "No se pudo descargar o cargar el modelo Whisper."
 }
