@@ -6,6 +6,8 @@ import struct
 import subprocess
 import sys
 import threading
+import signal
+from uuid import uuid4
 from collections import deque
 from contextlib import nullcontext
 import numpy as np
@@ -57,7 +59,7 @@ DEFAULT_OBSIDIAN_DIR = (
     )
 )
 OBSIDIAN_DIR = os.environ.get("OBSIDIAN_DIR", "").strip() or DEFAULT_OBSIDIAN_DIR
-NOTE_TITLE = f"Reunión - {datetime.now().strftime('%Y-%m-%d %H-%M')}.md"
+NOTE_TITLE = f"Reunión - {datetime.now().strftime('%Y-%m-%d %H-%M-%S')}-{uuid4().hex[:8]}.md"
 
 SAMPLE_RATE = 16000
 BLOCK_SECONDS = 30  # cada cuántos segundos se transcribe
@@ -66,7 +68,7 @@ WHISPER_BEAM_SIZE = 5
 WHISPER_VAD_FILTER = _env_bool("WHISPER_VAD_FILTER", default=True)
 WINDOWS_MICROPHONE = os.environ.get("WINDOWS_MICROPHONE", "").strip()
 WINDOWS_SPEAKER = os.environ.get("WINDOWS_SPEAKER", "").strip()
-WINDOWS_CAPTURE_FRAMES = 3200  # 200 ms a 16 kHz
+WINDOWS_BUFFER_SECONDS = max(0.2, _env_float("WINDOWS_BUFFER_SECONDS", 1.0))
 MAC_AUDIO_HELPER = os.environ.get("MAC_AUDIO_HELPER", "").strip() or os.path.join(
     PROJECT_DIR,
     "macos",
@@ -90,11 +92,17 @@ audio_queue = queue.Queue()
 running = True
 
 # 🔥 ESTE BLOQUE FALTABA
+if os.name == "nt":
+    print(f"🧠 Cargando Whisper {WHISPER_MODEL}...")
 model = WhisperModel(
     WHISPER_MODEL,
     device="auto",        # usa Apple Silicon si está disponible
-    compute_type="int8"   # rápido y suficiente para reuniones
+    compute_type="int8",   # rápido y suficiente para reuniones
+    **({"cpu_threads": max(1, min(4, (os.cpu_count() or 2) // 2))}
+       if os.name == "nt" else {}),
 )
+if os.name == "nt":
+    print("✅ Whisper listo; iniciando captura de audio")
 
 def voice_signature(audio, sr):
     mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=5)
@@ -118,7 +126,7 @@ def audio_callback(indata, frames, time_info, status):
     audio_queue.put(indata.copy())
 
 def write_header(file_path):
-    with open(file_path, "w", encoding="utf-8") as f:
+    with open(file_path, "x", encoding="utf-8") as f:
         f.write(f"# 🧠 Reunión\n\n")
         f.write(f"🕒 Inicio: {datetime.now().strftime('%H:%M')}\n\n")
         f.write("---\n\n")
@@ -134,8 +142,11 @@ def flush_buffer(buffer, file_path):
 
     audio = np.concatenate(buffer, axis=0).flatten()
     if len(audio) < SAMPLE_RATE * 1.5:
-        print("⚠️ Audio muy corto, se omite")
-        return
+        if os.name == "nt":
+            audio = np.pad(audio, (0, int(SAMPLE_RATE * 1.5) - len(audio)))
+        else:
+            print("⚠️ Audio muy corto, se omite")
+            return
         
     transcribe_options = dict(
         language=None,
@@ -147,6 +158,9 @@ def flush_buffer(buffer, file_path):
             min_silence_duration_ms=300,
         )
 
+    started = time.monotonic()
+    if os.name == "nt":
+        print(f"🧠 Transcribiendo {len(audio) / SAMPLE_RATE:.1f}s de audio...")
     segments, info = model.transcribe(audio, **transcribe_options)
 
     text = " ".join(seg.text for seg in segments).strip()
@@ -160,8 +174,17 @@ def flush_buffer(buffer, file_path):
         print("📝 Texto guardado")
     else:
         print("⚠️ Audio muy corto, sin texto detectado")
+    if os.name == "nt":
+        with audio_queue.mutex:
+            pending = sum(len(chunk) for chunk in audio_queue.queue) / SAMPLE_RATE
+        elapsed = time.monotonic() - started
+        print(f"📊 Whisper: {elapsed:.1f}s de procesamiento; audio pendiente={pending:.1f}s")
+        if elapsed > len(audio) / SAMPLE_RATE:
+            print("⚠️ Whisper procesa más lento que la captura; se está acumulando retraso")
 
-def transcriber_loop(file_path, stop_event=None):
+def transcriber_loop(file_path, stop_event=None, capture_done=None):
+    if capture_done is not None:
+        return windows_transcriber_loop(file_path, capture_done)
     buffer = []
     last_flush = time.time()
 
@@ -187,6 +210,30 @@ def transcriber_loop(file_path, stop_event=None):
         print("\n🧠 Finalizando reunión, guardando último audio...")
 
     # 🔥 FLUSH FINAL GARANTIZADO
+    if buffer:
+        flush_buffer(buffer, file_path)
+
+
+def windows_transcriber_loop(file_path, capture_done):
+    """Fixed sample-count batches; consume the complete capture tail at shutdown."""
+    buffer = []
+    buffered = 0
+    target = SAMPLE_RATE * BLOCK_SECONDS
+    print(f"⏱️ Primer bloque: {BLOCK_SECONDS}s de audio recibido, más el tiempo de Whisper")
+    while not (capture_done.is_set() and audio_queue.empty()):
+        try:
+            data = audio_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        while len(data):
+            count = min(len(data), target - buffered)
+            buffer.append(data[:count])
+            buffered += count
+            data = data[count:]
+            if buffered == target:
+                flush_buffer(buffer, file_path)
+                buffer.clear()
+                buffered = 0
     if buffer:
         flush_buffer(buffer, file_path)
 
@@ -572,79 +619,44 @@ def macos_audio_capture(stop_event, error_queue):
             stderr_thread.join(timeout=2)
 
 
-def windows_audio_capture(stop_event, error_queue):
-    """Capture the physical microphone and Windows speaker loopback."""
+def windows_audio_capture(stop_event, error_queue, capture_done):
     try:
-        import soundcard as sc
-
-        microphone = (
-            sc.get_microphone(WINDOWS_MICROPHONE)
-            if WINDOWS_MICROPHONE
-            else sc.default_microphone()
-        )
-        speaker = (
-            sc.get_speaker(WINDOWS_SPEAKER)
-            if WINDOWS_SPEAKER
-            else sc.default_speaker()
-        )
-        loopback = sc.get_microphone(
-            id=str(speaker.name),
-            include_loopback=True,
-        )
-        print(f"🎤 Micrófono Windows: {microphone.name}")
-        print(f"🔊 Loopback Windows: {speaker.name}")
-
-        # SoundCard documents a Windows/WASAPI single-channel issue, so both
-        # sources are opened in stereo and folded to mono ourselves.
-        with microphone.recorder(
-            samplerate=SAMPLE_RATE,
-            channels=2,
-            blocksize=WINDOWS_CAPTURE_FRAMES,
-        ) as mic_recorder, loopback.recorder(
-            samplerate=SAMPLE_RATE,
-            channels=2,
-            blocksize=WINDOWS_CAPTURE_FRAMES,
-        ) as loopback_recorder:
-            while not stop_event.is_set():
-                mic_audio = _mono_audio(
-                    mic_recorder.record(numframes=WINDOWS_CAPTURE_FRAMES)
-                )
-                loopback_audio = _mono_audio(
-                    loopback_recorder.record(numframes=WINDOWS_CAPTURE_FRAMES)
-                )
-                frames = min(len(mic_audio), len(loopback_audio))
-                if frames == 0:
-                    continue
-                # Averaging prevents clipping when both sources are loud.
-                mixed = np.nan_to_num(
-                    (mic_audio[:frames] + loopback_audio[:frames]) * 0.5,
-                    nan=0.0,
-                    posinf=1.0,
-                    neginf=-1.0,
-                )
-                audio_queue.put(mixed.reshape(-1, 1))
+        from windows_audio import capture
+        capture(audio_queue, stop_event, error_queue, rate=SAMPLE_RATE,
+                microphone_name=WINDOWS_MICROPHONE, speaker_name=WINDOWS_SPEAKER,
+                buffer_seconds=WINDOWS_BUFFER_SECONDS)
     except Exception as error:
         error_queue.put(error)
         stop_event.set()
+    finally:
+        capture_done.set()
 
 
 def main_windows(file_path):
     stop_event = threading.Event()
+    capture_done = threading.Event()
     error_queue = queue.Queue()
     capture_thread = threading.Thread(
         target=windows_audio_capture,
-        args=(stop_event, error_queue),
+        args=(stop_event, error_queue, capture_done),
         name="windows-audio-capture",
         daemon=True,
     )
-    capture_thread.start()
+    def request_stop(signum, frame):
+        if not stop_event.is_set():
+            print("\n🧠 Finalizando reunión; guardando todo el audio pendiente...")
+            stop_event.set()
+
+    previous_handler = signal.signal(signal.SIGINT, request_stop)
     try:
-        transcriber_loop(file_path, stop_event=stop_event)
+        capture_thread.start()
+        transcriber_loop(file_path, stop_event=stop_event, capture_done=capture_done)
     finally:
         stop_event.set()
         capture_thread.join(timeout=5)
+        signal.signal(signal.SIGINT, previous_handler)
 
-    if not error_queue.empty():
+    while not error_queue.empty():
         error = error_queue.get()
         print(f"❌ No se pudo capturar micrófono + loopback en Windows: {error}")
 
@@ -677,7 +689,7 @@ def main():
 
     if os.name == "nt":
         print(f"📂 Guardando en: {file_path}")
-        print("🎙️ Capturando micrófono y audio de Teams... Ctrl+C para terminar\n")
+        print("🎙️ Capturando micrófono y audio del sistema... Ctrl+C para terminar\n")
         main_windows(file_path)
         print("\n🛑 Reunión finalizada")
         return

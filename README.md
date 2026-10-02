@@ -114,3 +114,44 @@ con el loopback WASAPI del altavoz predeterminado para recibir tu voz y el
 audio de la reunión o de cualquier otra aplicación. Si necesitas seleccionar
 dispositivos concretos, usa
 `WINDOWS_MICROPHONE` y `WINDOWS_SPEAKER` con parte de sus nombres.
+
+### Windows 11 y sesiones RDP / Windows App
+
+La captura usa un hilo por fuente, con COM inicializado en cada hilo, WASAPI en
+modo compartido, lecturas de 50 ms y un búfer solicitado de un segundo. Una fuente
+retrasada no bloquea a la otra. El loopback se selecciona por el ID del altavoz,
+evitando confundir entrada y salida cuando ambas se llaman `Audio remoto`.
+
+Al conectar desde macOS, activa en Windows App la redirección del micrófono y
+del sonido. La reunión y el transcriptor deben ejecutarse en la misma sesión de
+Windows. Deja `WINDOWS_MICROPHONE` y `WINDOWS_SPEAKER` vacíos para seguir los
+dispositivos predeterminados, incluidos los remotos. Se comprueban los cambios
+de dispositivo cada dos segundos cuando el controlador entrega datos. Ante un
+error, cada fuente reintenta independientemente con esperas de hasta 15 segundos.
+
+La consola distingue carga del modelo, recepción de muestras, silencio o nivel
+bajo y procesamiento de Whisper. Cada 15 segundos muestra discontinuidades por
+fuente y huecos estimados. El aviso `data discontinuity in recording` se cuenta
+en ese resumen: indica cortes de captura, no la eliminación de texto ya escrito.
+Si persisten, puedes probar `WINDOWS_BUFFER_SECONDS=2.0`; WASAPI puede ignorar
+el tamaño solicitado. No se utiliza modo exclusivo.
+
+En Windows se transcriben bloques de 30 segundos de audio recibido. Después de
+cada bloque se muestra el tiempo de procesamiento y los segundos pendientes.
+Si el retraso crece continuamente, Whisper no alcanza el ritmo de la reunión:
+evalúa la carga del equipo y, si aceptas menor precisión, prueba `small`.
+`Ctrl+C` detiene la captura y guarda los bloques pendientes antes de finalizar;
+puede tardar si hay una cola acumulada. Las notas tienen nombres únicos y nunca
+sobrescriben una nota existente. No se crean archivos WAV temporales.
+
+La alineación de las fuentes usa tiempos monotónicos estimados: SoundCard no
+expone los timestamps de WASAPI. No recupera audio que RDP no haya entregado.
+Si un controlador queda bloqueado dentro de una lectura, se informa y el cierre
+guarda el audio disponible sin esperar indefinidamente por ese hilo; para esa
+fuente puede ser necesario reiniciar el programa. El texto guardado previamente
+permanece en la nota.
+
+Para validar en tu Windows 11: prueba voces conocidas tanto localmente como por
+RDP, alterna conversación y silencio, desconecta/reconecta la sesión y termina
+con `Ctrl+C`. Comprueba ambas voces, los contadores de cortes y el último texto.
+Las pruebas automatizadas simulan fuentes; no sustituyen esta prueba WASAPI real.
