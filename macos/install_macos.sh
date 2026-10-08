@@ -38,6 +38,21 @@ echo "Descargando y verificando el modelo Whisper configurado..."
 echo "Preparando el capturador nativo de audio del sistema..."
 "$PROJECT_DIR/macos/build_audio_capture.sh"
 
+CAPTURE_HELPER="$PROJECT_DIR/macos/.build/MeetingTranscriberAudio.app/Contents/MacOS/MeetingTranscriberAudio"
+echo
+echo "Comprobando el permiso de captura de audio del sistema..."
+if "$CAPTURE_HELPER" --check-permissions; then
+  echo "✅ Permiso de captura de audio del sistema confirmado."
+else
+  echo
+  echo "⚠️ No se pudo confirmar el permiso de captura de audio del sistema."
+  echo "La instalación quedó preparada; antes de transcribir, abre:"
+  echo "Ajustes del Sistema > Privacidad y seguridad >"
+  echo "Grabación de pantalla y del audio del sistema."
+  echo "Activa la aplicación que macOS identifica en el aviso (normalmente Terminal)."
+  echo "Si ofrece la opción, permite solo audio. Luego cierra y vuelve a abrir esa aplicación."
+fi
+
 echo
 echo "Instalación de macOS terminada."
 echo "Configura OBSIDIAN_DIR en .env si hace falta y ejecuta start_transcribe.sh."

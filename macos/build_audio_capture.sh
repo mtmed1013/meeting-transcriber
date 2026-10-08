@@ -18,9 +18,13 @@ ensure_command_line_tools
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 
 MACOS_MAJOR="$(sw_vers -productVersion | cut -d. -f1)"
-SWIFT_FLAGS=()
+SWIFT_FLAGS=(
+  -framework AVFoundation
+  -framework CoreMedia
+  -framework ScreenCaptureKit
+)
 if [[ "$MACOS_MAJOR" -ge 15 ]]; then
-  SWIFT_FLAGS+=(-D NATIVE_MICROPHONE)
+  SWIFT_FLAGS=(-D NATIVE_MICROPHONE "${SWIFT_FLAGS[@]}")
 fi
 
 xcrun swiftc \
@@ -28,9 +32,6 @@ xcrun swiftc \
   -parse-as-library \
   -O \
   "${SWIFT_FLAGS[@]}" \
-  -framework AVFoundation \
-  -framework CoreMedia \
-  -framework ScreenCaptureKit \
   "$SOURCE_DIR/main.swift" \
   -o "$BINARY"
 

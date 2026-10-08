@@ -12,7 +12,14 @@ instalador:
 - crea el entorno virtual e instala las dependencias;
 - crea `.env` solo si todavía no existe;
 - descarga y verifica el modelo Whisper configurado;
-- compila el capturador nativo de audio del sistema.
+- compila el capturador nativo de audio del sistema;
+- comprueba el permiso de macOS para capturar el audio del sistema.
+
+Durante esa última comprobación, macOS puede solicitar permiso. El instalador
+solo consulta el acceso; no inicia una grabación ni guarda audio. Acepta el
+permiso para la aplicación que macOS identifica en el aviso (normalmente
+Terminal si abriste `install_macos.command`). Si ofrece la opción, puedes
+permitir solo audio.
 
 La instalación de las Command Line Tools no puede hacerse de forma silenciosa:
 macOS mostrará una ventana donde debes aceptar y posiblemente autorizar con una
@@ -54,11 +61,12 @@ python -m pip install -r requirements.txt
 
 `start_transcribe.sh` comprueba las Command Line Tools y compila
 automáticamente, una sola vez, el componente nativo que captura el audio del
-sistema mediante ScreenCaptureKit. La primera vez, macOS solicitará
-autorización para grabar el audio del sistema. Puedes
-revisarla en `Configuración del Sistema > Privacidad y seguridad > Grabación de
-pantalla y audio del sistema`. El micrófono continúa siendo un permiso
-independiente.
+sistema mediante ScreenCaptureKit. Si el permiso se rechazó previamente, macOS
+no volverá a mostrar la solicitud automáticamente: habilita la aplicación que
+macOS asocia con la captura en `Ajustes del Sistema > Privacidad y seguridad >
+Grabación de pantalla y del audio del sistema`, y luego reinicia esa aplicación
+antes de volver a ejecutar el transcriptor. El micrófono continúa siendo un
+permiso independiente y puede solicitarse al iniciar una transcripción.
 
 En macOS 15 o superior, el capturador nativo recibe en el mismo flujo el audio
 de todo el sistema y el micrófono. Esto evita desincronizaciones entre dos

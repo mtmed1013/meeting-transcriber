@@ -278,6 +278,39 @@ final class CaptureController {
         output = CaptureOutput(writer: writer)
     }
 
+    func checkPermissions() {
+        SCShareableContent.getExcludingDesktopWindows(
+            false,
+            onScreenWindowsOnly: false
+        ) { [weak self] availableContent, error in
+            guard let self else { return }
+
+            if let error {
+                self.fail(
+                    "macOS no autorizó la captura del audio del sistema. " +
+                    "En Ajustes del Sistema > Privacidad y seguridad > " +
+                    "Grabación de pantalla y del audio del sistema, activa " +
+                    "la aplicación que aparece en el aviso de macOS " +
+                    "(normalmente Terminal). " +
+                    "Detalle: \(error)"
+                )
+                return
+            }
+
+            guard let availableContent, !availableContent.displays.isEmpty else {
+                self.fail(
+                    "macOS no encontró una pantalla disponible para comprobar " +
+                    "el permiso de captura."
+                )
+                return
+            }
+
+            fputs("MEETING_AUDIO_PERMISSION_READY\n", stderr)
+            fflush(stderr)
+            exit(0)
+        }
+    }
+
     func start() {
         SCShareableContent.getExcludingDesktopWindows(
             false,
@@ -362,7 +395,11 @@ final class CaptureController {
 struct MeetingTranscriberAudio {
     static func main() {
         let controller = CaptureController()
-        controller.start()
+        if CommandLine.arguments.dropFirst().contains("--check-permissions") {
+            controller.checkPermissions()
+        } else {
+            controller.start()
+        }
         dispatchMain()
     }
 }

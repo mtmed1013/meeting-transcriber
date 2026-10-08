@@ -10,7 +10,8 @@ set -e
 
 echo
 if [[ "$install_status" -eq 0 ]]; then
-  echo "Ya puedes usar start_transcribe.sh para iniciar una transcripción."
+  echo "Instalación finalizada. Revisa los mensajes anteriores sobre permisos."
+  echo "Cuando el permiso esté activo, usa start_transcribe.sh para transcribir."
 else
   echo "La instalación no terminó correctamente. Revisa el mensaje anterior."
 fi

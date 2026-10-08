@@ -18,6 +18,8 @@
 	<string>1</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Meeting Transcriber necesita capturar el audio del sistema para transcribir reuniones.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Meeting Transcriber necesita capturar el audio del sistema para transcribir reuniones, incluso cuando se usan audífonos.</string>
 	<key>NSMicrophoneUsageDescription</key>
