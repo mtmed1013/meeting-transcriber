@@ -115,7 +115,7 @@ audio de la reunión o de cualquier otra aplicación. Si necesitas seleccionar
 dispositivos concretos, usa
 `WINDOWS_MICROPHONE` y `WINDOWS_SPEAKER` con parte de sus nombres.
 
-### Windows 11 y sesiones RDP / Windows App
+### Windows 11, diademas y audio remoto
 
 Windows usa `WINDOWS_WHISPER_MODEL=small` por defecto; macOS conserva
 `WHISPER_MODEL=medium`. Para mantener medium en Windows, define
@@ -150,12 +150,24 @@ modo compartido, lecturas de 50 ms y un búfer solicitado de un segundo. Una fue
 retrasada no bloquea a la otra. El loopback se selecciona por el ID del altavoz,
 evitando confundir entrada y salida cuando ambas se llaman `Audio remoto`.
 
-Al conectar desde macOS, activa en Windows App la redirección del micrófono y
-del sonido. La reunión y el transcriptor deben ejecutarse en la misma sesión de
-Windows. Deja `WINDOWS_MICROPHONE` y `WINDOWS_SPEAKER` vacíos para seguir los
-dispositivos predeterminados, incluidos los remotos. Se comprueban los cambios
-de dispositivo cada dos segundos cuando el controlador entrega datos. Ante un
-error, cada fuente reintenta independientemente con esperas de hasta 15 segundos.
+En equipos locales, el transcriptor prueba primero el micrófono predeterminado.
+Si no puede abrirlo (por ejemplo, una diadema Jabra con un formato que el
+controlador de captura no admite), busca otras entradas y prioriza nombres que
+parezcan micrófonos integrados como `Microphone Array`, Realtek o Intel Smart
+Sound. Indica el dispositivo alternativo en la consola. Si el micrófono
+predeterminado funciona, lo conserva aunque esté silencioso; el silencio por sí
+solo no permite distinguir una reunión en pausa de un fallo del micrófono.
+
+El loopback continúa capturando desde la salida predeterminada (por ejemplo, la
+Jabra), por lo que la transcripción puede combinar el audio de la reunión que
+sale por la diadema con tu voz captada por el micrófono integrado. La voz puede
+sonar más baja o recoger más ruido según la distancia al micrófono. Puedes
+seleccionar manualmente una entrada con `WINDOWS_MICROPHONE`.
+
+En una conexión desde macOS, activa en Windows App la redirección del micrófono
+y del sonido. La reunión y el transcriptor deben ejecutarse en la misma sesión
+de Windows. Las fuentes se reintentan independientemente; la consola muestra el
+tipo y detalle de errores al abrirlas.
 
 La consola distingue carga del modelo, recepción de muestras, silencio o nivel
 bajo y procesamiento de Whisper. Cada 15 segundos muestra discontinuidades por

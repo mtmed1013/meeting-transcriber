@@ -35,6 +35,43 @@ def select_device(sc, source, microphone_name, speaker_name):
     return device
 
 
+def microphone_candidates(sc, microphone_name=""):
+    """Try the configured/default mic first, then prefer built-in inputs."""
+    result = []
+    if microphone_name:
+        try:
+            result.append(sc.get_microphone(microphone_name))
+        except Exception as error:
+            print(f"⚠️ No se encontró WINDOWS_MICROPHONE='{microphone_name}': "
+                  f"{type(error).__name__}: {error!r}; buscando entradas disponibles")
+    try:
+        preferred = sc.default_microphone()
+        if all(device.id != preferred.id for device in result):
+            result.append(preferred)
+    except Exception as error:
+        print(f"⚠️ No se pudo consultar el micrófono predeterminado: "
+              f"{type(error).__name__}: {error!r}")
+    try:
+        available = sc.all_microphones(include_loopback=False)
+    except TypeError:
+        available = sc.all_microphones()
+
+    integrated_terms = (
+        "array", "integrated", "internal", "built-in", "builtin",
+        "realtek", "conexant", "intel smart sound", "microphone array",
+    )
+    available.sort(key=lambda device: (
+        0 if any(term in device.name.casefold() for term in integrated_terms) else 1,
+        device.name.casefold(),
+    ))
+    seen = {device.id for device in result}
+    for device in available:
+        if not getattr(device, "isloopback", False) and device.id not in seen:
+            result.append(device)
+            seen.add(device.id)
+    return result
+
+
 class Timeline:
     """Align sample spans using an estimated monotonic capture timeline."""
 
@@ -74,7 +111,8 @@ def capture(output_queue, stop_event, error_queue, rate=16000,
     labels = {"microphone": "micrófono", "system": "loopback"}
     state_lock = threading.Lock()
     states = {source: {"last": time.monotonic(), "level": None, "gaps": 0,
-                       "active": False, "frames": 0, "peak": 0.0} for source in labels}
+                       "active": False, "frames": 0, "peak": 0.0,
+                       "device": ""} for source in labels}
     original_warning = warnings.showwarning
 
     def report_warning(message, category, filename, lineno, file=None, line=None):
@@ -90,53 +128,87 @@ def capture(output_queue, stop_event, error_queue, rate=16000,
         try:
             with com_thread():
                 failures = 0
+                failed_devices = {}
                 while not stop_event.is_set():
                     try:
-                        device = select_device(sc, source, microphone_name, speaker_name)
-                        print(f"🎙️ {labels[source]} Windows: {device.name} (id={device.id})")
-                        with device.recorder(samplerate=rate, channels=2,
-                                             blocksize=int(rate * buffer_seconds),
-                                             exclusive_mode=False) as recorder:
-                            cursor = time.monotonic()
-                            check_at = cursor + 2
-                            first = True
-                            while not stop_event.is_set():
-                                data = recorder.record(numframes=rate // 20)
-                                now = time.monotonic()
-                                samples = np.nan_to_num(np.mean(data, axis=1),
-                                                        nan=0.0, posinf=0.0, neginf=0.0)
-                                if len(samples):
-                                    # SoundCard does not expose WASAPI timestamps.
-                                    # Anchor on opening; re-anchor after a long stall.
-                                    if now - cursor > buffer_seconds + 0.5:
-                                        cursor = now - len(samples) / rate
-                                    packets.put((source, cursor, samples.copy()))
-                                    cursor += len(samples) / rate
-                                    # Some virtual endpoints deliver synthetic silence quickly.
-                                    # Do not let sample count run minutes ahead of wall time.
-                                    stop_event.wait(max(0, cursor - time.monotonic()))
-                                    with state_lock:
-                                        states[source].update(last=now, active=True,
-                                            level=float(np.sqrt(np.mean(samples ** 2))))
-                                        states[source]["frames"] += len(samples)
-                                        states[source]["peak"] = max(states[source]["peak"], float(np.max(np.abs(samples))))
-                                    if first:
-                                        print(f"✅ Recibiendo audio de {labels[source]} (puede ser silencio)")
-                                        first = False
-                                    failures = 0
-                                if now >= check_at:
-                                    current = select_device(sc, source, microphone_name, speaker_name)
-                                    if current.id != device.id:
-                                        print(f"🔄 Cambió {labels[source]}; reabriendo el dispositivo")
-                                        break
-                                    check_at = now + 2
+                        if source == "microphone":
+                            devices = microphone_candidates(sc, microphone_name)
+                        else:
+                            devices = [select_device(sc, source, microphone_name, speaker_name)]
                     except Exception as error:
-                        with state_lock:
-                            states[source]["active"] = False
                         failures += 1
                         delay = min(2 ** min(failures, 4), 15)
-                        print(f"⚠️ {labels[source]} no disponible: {error}. Reintento en {delay}s")
-                        # Bounded attempt rate; retain the other source throughout RDP outages.
+                        print(f"⚠️ No se pudieron consultar dispositivos de {labels[source]}: "
+                              f"{type(error).__name__}: {error!r}; reintento en {delay}s")
+                        stop_event.wait(delay)
+                        continue
+                    any_opened = False
+                    for index, device in enumerate(devices):
+                        if stop_event.is_set():
+                            break
+                        if failed_devices.get(device.id, 0) > time.monotonic():
+                            continue
+                        try:
+                            print(f"🎙️ Probando {labels[source]}: {device.name} (id={device.id})")
+                            with device.recorder(samplerate=rate, channels=2,
+                                                 blocksize=int(rate * buffer_seconds),
+                                                 exclusive_mode=False) as recorder:
+                                if source == "microphone":
+                                    if index:
+                                        print(f"🔁 Micrófono predeterminado no disponible; usando respaldo: {device.name}")
+                                    else:
+                                        print(f"✅ Micrófono seleccionado: {device.name}")
+                                with state_lock:
+                                    states[source]["device"] = device.name
+                                    states[source]["active"] = True
+                                any_opened = True
+                                cursor = time.monotonic()
+                                check_at = cursor + 2
+                                first = True
+                                while not stop_event.is_set():
+                                    data = recorder.record(numframes=rate // 20)
+                                    now = time.monotonic()
+                                    samples = np.nan_to_num(np.mean(data, axis=1),
+                                                            nan=0.0, posinf=0.0, neginf=0.0)
+                                    if len(samples):
+                                        if now - cursor > buffer_seconds + 0.5:
+                                            cursor = now - len(samples) / rate
+                                        packets.put((source, cursor, samples.copy()))
+                                        cursor += len(samples) / rate
+                                        stop_event.wait(max(0, cursor - time.monotonic()))
+                                        with state_lock:
+                                            states[source].update(last=now, active=True,
+                                                level=float(np.sqrt(np.mean(samples ** 2))))
+                                            states[source]["frames"] += len(samples)
+                                            states[source]["peak"] = max(states[source]["peak"], float(np.max(np.abs(samples))))
+                                        if first:
+                                            print(f"✅ Recibiendo audio de {labels[source]} (puede ser silencio)")
+                                            first = False
+                                        failures = 0
+                                    if source == "system" and now >= check_at:
+                                        current = select_device(sc, source, microphone_name, speaker_name)
+                                        if current.id != device.id:
+                                            print("🔄 Cambió el altavoz; reabriendo el loopback")
+                                            break
+                                        check_at = now + 2
+                            if source == "microphone" and not stop_event.is_set():
+                                # A healthy fallback stays selected; don't churn back to
+                                # a headset endpoint that already failed to open.
+                                continue
+                        except Exception as error:
+                            detail = f"{type(error).__name__}: {error!r}"
+                            print(f"⚠️ No se pudo abrir {labels[source]} '{device.name}': {detail}")
+                            failed_devices[device.id] = time.monotonic() + 60
+                            with state_lock:
+                                states[source]["active"] = False
+                            if source != "microphone":
+                                failures += 1
+                                stop_event.wait(min(2 ** min(failures, 4), 15))
+                                break
+                    if source == "microphone" and not any_opened:
+                        failures += 1
+                        delay = min(2 ** min(failures, 4), 15)
+                        print(f"⚠️ No se pudo abrir ningún micrófono; nueva búsqueda en {delay}s")
                         stop_event.wait(delay)
         except Exception as error:
             error_queue.put(RuntimeError(f"Captura {labels[source]}: {error}"))
@@ -192,7 +264,7 @@ def capture(output_queue, stop_event, error_queue, rate=16000,
                     level = state["level"]
                     status = "sin muestras" if age > 3 else (
                         "silencio/nivel bajo" if level is None or level < 0.001 else "audio presente")
-                    print(f"📊 {labels[source]}: {status}; discontinuidades={state['gaps']}; "
+                    print(f"📊 {labels[source]} ({state['device'] or 'sin dispositivo'}): {status}; discontinuidades={state['gaps']}; "
                           f"RMS={level or 0:.6f}; pico={state['peak']:.6f}; "
                           f"recibido={state['frames'] / rate:.1f}s; huecos={missing[source] / rate:.1f}s/15s")
                     if age > 3 and state["active"]:
