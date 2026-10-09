@@ -87,6 +87,7 @@ class WindowsAudioTests(unittest.TestCase):
         saved = []
         namespace = dict(queue=queue, time=time, datetime=datetime, timedelta=timedelta,
                          audio_queue=chunks, SAMPLE_RATE=1, BLOCK_SECONDS=10,
+                         transcriber=types.SimpleNamespace(name="Test engine"),
                          flush_buffer=lambda buffer, path, stamp=None: saved.append(sum(len(x) for x in buffer)))
         exec(compile(ast.Module(body=[function], type_ignores=[]), "loop", "exec"), namespace)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -134,7 +135,9 @@ class WindowsAudioTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertTrue(errors.empty())
         self.assertGreaterEqual(len(attempts), 2)
-        self.assertTrue(any(np.max(chunk[1]) > 0.9 for chunk in list(output.queue)))
+        # The two sources are averaged, so a unity signal from one source is
+        # expected to peak at 0.5 when the other source is silent.
+        self.assertTrue(any(np.max(chunk[1]) > 0.4 for chunk in list(output.queue)))
 
 
 if __name__ == "__main__":

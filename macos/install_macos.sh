@@ -23,14 +23,72 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
   python3 -m venv "$PROJECT_DIR/venv"
 fi
 
+MACOS_ARCH="$(uname -m)"
+if [[ "$(sysctl -in hw.optional.arm64 2>/dev/null || echo 0)" == "1" ]]; then
+  MACOS_ARCH="arm64"
+fi
+PYTHON_ARCH="$("$VENV_PYTHON" -c 'import platform; print(platform.machine())')"
+if [[ "$MACOS_ARCH" == "arm64" && "$PYTHON_ARCH" != "arm64" && "$PYTHON_ARCH" != "aarch64" ]]; then
+  echo "Este Mac tiene Apple Silicon, pero el Python del entorno es $PYTHON_ARCH."
+  echo "Instala/usa Python nativo ARM64 y vuelve a ejecutar el instalador."
+  exit 1
+fi
+
 echo "Instalando dependencias de Python..."
 "$VENV_PYTHON" -m pip install --upgrade pip
 "$VENV_PYTHON" -m pip install -r "$PROJECT_DIR/requirements.txt"
+"$VENV_PYTHON" -m pip uninstall -y transcribe-cpp transcribe-cpp-native
 
 if [[ ! -f "$PROJECT_DIR/.env" ]]; then
   cp "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env"
   echo "Creado .env con la configuración inicial."
 fi
+
+MODEL_DIR="$PROJECT_DIR/models"
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+  "$VENV_PYTHON" - "$PROJECT_DIR/.env" <<'PY'
+import os
+import re
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+env_path = Path(sys.argv[1])
+with env_path.open("r", encoding="utf-8", newline="") as env_file:
+    contents = env_file.read()
+pattern = re.compile(
+    r"(?im)^([ \t]*TRANSCRIPTION_ENGINE[ \t]*=[ \t]*)(?:canary|nemotron)"
+    r"(?=[ \t]*(?:#[^\r\n]*)?(?:\r?$))"
+)
+updated, count = pattern.subn(r"\1whisper", contents)
+if count:
+    fd, temporary_path = tempfile.mkstemp(prefix=".env.", dir=env_path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as output:
+            output.write(updated)
+        os.chmod(temporary_path, stat.S_IMODE(env_path.stat().st_mode))
+        os.replace(temporary_path, env_path)
+    except BaseException:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+    print("TRANSCRIPTION_ENGINE antiguo migrado a whisper en .env.")
+PY
+fi
+
+for obsolete_model in \
+  "$MODEL_DIR/nemotron-3.5-asr-streaming-0.6b-Q8_0.gguf" \
+  "$MODEL_DIR"/.nemotron-3.5-asr-streaming-0.6b.* \
+  "$MODEL_DIR/canary-180m-flash-Q8_0.gguf" \
+  "$MODEL_DIR"/.canary-180m-flash.*; do
+  if [[ -f "$obsolete_model" ]]; then
+    rm -- "$obsolete_model"
+    echo "Artefacto local obsoleto de Canary/Nemotron eliminado: $(basename "$obsolete_model")"
+  fi
+done
 
 echo "Descargando y verificando el modelo Whisper configurado..."
 "$VENV_PYTHON" -c "from dotenv import load_dotenv; import os; from faster_whisper import WhisperModel; load_dotenv('.env'); name = os.getenv('WHISPER_MODEL', '').strip() or 'medium'; print(f'Modelo: {name}'); WhisperModel(name, device='cpu', compute_type='int8'); print('Modelo listo.')"

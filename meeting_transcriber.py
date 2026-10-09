@@ -13,11 +13,11 @@ from contextlib import nullcontext
 import numpy as np
 import sounddevice as sd
 from datetime import datetime, timedelta
-from faster_whisper import WhisperModel
 from dotenv import load_dotenv
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 import librosa
+from transcription_engines import create_transcriber, resolve_engine
 
 # ================= CONFIG =================
 
@@ -64,10 +64,18 @@ NOTE_TITLE = f"Reunión - {datetime.now().strftime('%Y-%m-%d %H-%M-%S')}-{uuid4(
 SAMPLE_RATE = 16000
 BLOCK_SECONDS = 30  # cada cuántos segundos se transcribe
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "").strip() or "medium"
-if os.name == "nt":
-    WHISPER_MODEL = os.environ.get("WINDOWS_WHISPER_MODEL", "").strip() or "small"
-WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "es").strip().lower() or "es"
-WHISPER_LANGUAGE = None if WHISPER_LANGUAGE == "auto" else WHISPER_LANGUAGE
+WINDOWS_WHISPER_MODEL = (
+    os.environ.get("WINDOWS_WHISPER_MODEL", "").strip() or "small"
+)
+TRANSCRIPTION_ENGINE = os.environ.get("TRANSCRIPTION_ENGINE", "auto").strip() or "auto"
+TRANSCRIPTION_LANGUAGE = (
+    os.environ.get("TRANSCRIPTION_LANGUAGE", "").strip().lower()
+    or os.environ.get("WHISPER_LANGUAGE", "es").strip().lower()
+    or "es"
+)
+TRANSCRIPTION_LANGUAGE = (
+    None if TRANSCRIPTION_LANGUAGE == "auto" else TRANSCRIPTION_LANGUAGE
+)
 SPEAKER_MARKERS = _env_bool("SPEAKER_MARKERS", default=False)
 WHISPER_BEAM_SIZE = 5
 WHISPER_VAD_FILTER = _env_bool("WHISPER_VAD_FILTER", default=True)
@@ -85,6 +93,7 @@ MAC_AUDIO_HELPER = os.environ.get("MAC_AUDIO_HELPER", "").strip() or os.path.joi
 )
 MAC_AUDIO_MIX_FRAMES = 320  # 20 ms a 16 kHz
 MAC_AUDIO_JITTER_SECONDS = 0.35
+MAC_AUDIO_DIAGNOSTIC_SECONDS = 15
 MAC_SYSTEM_GAIN = _env_float("MAC_SYSTEM_GAIN", 1.0)
 MAC_MICROPHONE_GAIN = _env_float("MAC_MICROPHONE_GAIN", 1.0)
 MAC_NATIVE_MICROPHONE = _macos_version_at_least(15)
@@ -96,18 +105,17 @@ last_voice_signature = None
 audio_queue = queue.Queue()
 running = True
 
-# 🔥 ESTE BLOQUE FALTABA
-if os.name == "nt":
-    print(f"🧠 Cargando Whisper {WHISPER_MODEL}...")
-model = WhisperModel(
-    WHISPER_MODEL,
-    device="auto",        # usa Apple Silicon si está disponible
-    compute_type="int8",   # rápido y suficiente para reuniones
-    **({"cpu_threads": max(1, min(4, (os.cpu_count() or 2) // 2))}
-       if os.name == "nt" else {}),
+RESOLVED_TRANSCRIPTION_ENGINE = resolve_engine(TRANSCRIPTION_ENGINE)
+print(f"🧠 Cargando motor local: {RESOLVED_TRANSCRIPTION_ENGINE}...")
+transcriber = create_transcriber(
+    TRANSCRIPTION_ENGINE,
+    language=TRANSCRIPTION_LANGUAGE,
+    whisper_model=WHISPER_MODEL,
+    windows_whisper_model=WINDOWS_WHISPER_MODEL,
+    vad_filter=WHISPER_VAD_FILTER,
+    beam_size=WHISPER_BEAM_SIZE,
 )
-if os.name == "nt":
-    print("✅ Whisper listo; iniciando captura de audio")
+print(f"✅ {transcriber.name} listo; iniciando captura de audio")
 
 def voice_signature(audio, sr):
     mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=5)
@@ -141,34 +149,25 @@ def append_text(file_path, text, audio_time=None):
     with open(file_path, "a", encoding="utf-8") as f:
         f.write(f"**[{timestamp}]**\n{text.strip()}\n\n")
 
+
 def flush_buffer(buffer, file_path, audio_time=None):
     if not buffer:
         return
 
     audio = np.concatenate(buffer, axis=0).flatten()
-    if len(audio) < SAMPLE_RATE * 1.5:
+    if len(audio) < SAMPLE_RATE * 1.5 and transcriber.name.startswith("Whisper"):
         if os.name == "nt":
             audio = np.pad(audio, (0, int(SAMPLE_RATE * 1.5) - len(audio)))
         else:
             print("⚠️ Audio muy corto, se omite")
             return
-        
-    transcribe_options = dict(
-        language=WHISPER_LANGUAGE,
-        vad_filter=WHISPER_VAD_FILTER,
-        beam_size=WHISPER_BEAM_SIZE,
-    )
-    if WHISPER_VAD_FILTER:
-        transcribe_options["vad_parameters"] = dict(
-            min_silence_duration_ms=300,
-        )
 
     started = time.monotonic()
-    if os.name == "nt":
-        print(f"🧠 Transcribiendo {len(audio) / SAMPLE_RATE:.1f}s de audio...")
-    segments, info = model.transcribe(audio, **transcribe_options)
-
-    text = " ".join(seg.text for seg in segments).strip()
+    print(
+        f"🧠 Transcribiendo {len(audio) / SAMPLE_RATE:.1f}s "
+        f"con {transcriber.name}..."
+    )
+    text = transcriber.transcribe(audio)
     if text and SPEAKER_MARKERS and speaker_changed(voice_signature(audio, SAMPLE_RATE)):
         append_text(file_path, "— 🔄 Cambio de hablante estimado —", audio_time)
 
@@ -177,43 +176,67 @@ def flush_buffer(buffer, file_path, audio_time=None):
         print("📝 Texto guardado")
     else:
         print("⚠️ Sin voz o texto detectado en este bloque")
-    if os.name == "nt":
-        with audio_queue.mutex:
-            pending = sum(len(chunk[1]) if isinstance(chunk, tuple) else len(chunk)
-                          for chunk in audio_queue.queue) / SAMPLE_RATE
-        elapsed = time.monotonic() - started
-        print(f"📊 Whisper: {elapsed:.1f}s de procesamiento; audio pendiente={pending:.1f}s")
-        if elapsed > len(audio) / SAMPLE_RATE:
-            print("⚠️ Whisper procesa más lento que la captura; se está acumulando retraso")
+    with audio_queue.mutex:
+        pending = sum(
+            len(chunk[1]) if isinstance(chunk, tuple) else len(chunk)
+            for chunk in audio_queue.queue
+        ) / SAMPLE_RATE
+    elapsed = time.monotonic() - started
+    print(
+        f"📊 {transcriber.name}: {elapsed:.1f}s de procesamiento; "
+        f"audio pendiente={pending:.1f}s"
+    )
+    if elapsed > len(audio) / SAMPLE_RATE:
+        print("⚠️ El motor procesa más lento que la captura; se está acumulando retraso")
+
 
 def transcriber_loop(file_path, stop_event=None, capture_done=None):
-    if capture_done is not None:
+    if capture_done is not None and os.name == "nt":
         return windows_transcriber_loop(file_path, capture_done)
+
     buffer = []
-    last_flush = time.time()
+    buffered = 0
+    target = SAMPLE_RATE * BLOCK_SECONDS
+    interrupted = False
+    pending_data = None
+    print(f"⏱️ Se transcriben bloques de {BLOCK_SECONDS}s de audio recibido")
 
-    try:
-        while True:
-            if stop_event is not None and stop_event.is_set() and audio_queue.empty():
-                break
-            try:
-                data = audio_queue.get(timeout=1)
-                buffer.append(data)
-
-                if time.time() - last_flush >= BLOCK_SECONDS:
-                    flush_buffer(buffer, file_path)
-                    buffer.clear()
-                    last_flush = time.time()
-
-            except queue.Empty:
-                if stop_event is not None and stop_event.is_set():
-                    break
+    while True:
+        try:
+            if buffered == target:
+                flush_buffer(buffer, file_path)
+                buffer.clear()
+                buffered = 0
                 continue
 
-    except KeyboardInterrupt:
-        print("\n🧠 Finalizando reunión, guardando último audio...")
+            capture_finished = (
+                capture_done.is_set()
+                if capture_done is not None
+                else stop_event is not None and stop_event.is_set()
+            )
+            if capture_finished and audio_queue.empty() and pending_data is None:
+                break
 
-    # 🔥 FLUSH FINAL GARANTIZADO
+            if pending_data is None:
+                data = audio_queue.get(timeout=0.2)
+                if isinstance(data, tuple):
+                    data = data[-1]
+                pending_data = np.asarray(data).reshape(-1)
+
+            count = min(len(pending_data), target - buffered)
+            buffer.append(pending_data[:count])
+            buffered += count
+            pending_data = pending_data[count:] if count < len(pending_data) else None
+        except queue.Empty:
+            continue
+        except KeyboardInterrupt:
+            if not interrupted:
+                print("\n🧠 Finalizando reunión, guardando todo el audio pendiente...")
+                interrupted = True
+                if stop_event is not None:
+                    stop_event.set()
+            continue
+
     if buffer:
         flush_buffer(buffer, file_path)
 
@@ -228,7 +251,10 @@ def windows_transcriber_loop(file_path, capture_done):
     mono_origin = time.monotonic()
     processed = 0
     processing_seconds = 0.0
-    print(f"⏱️ Primer bloque: {BLOCK_SECONDS}s de audio recibido, más el tiempo de Whisper")
+    print(
+        f"⏱️ Primer bloque: {BLOCK_SECONDS}s de audio recibido, "
+        f"más el tiempo de {transcriber.name}"
+    )
     while not (capture_done.is_set() and audio_queue.empty()):
         try:
             data = audio_queue.get(timeout=0.2)
@@ -269,6 +295,21 @@ def _mono_audio(data):
     if audio.ndim == 1:
         return audio
     return np.mean(audio, axis=1)
+
+
+def _empty_audio_level_stats():
+    return {"sum_squares": 0.0, "sample_count": 0, "peak": 0.0}
+
+
+def _accumulate_audio_level(stats, samples):
+    values = np.asarray(samples, dtype=np.float64).reshape(-1)
+    if not values.size:
+        return
+
+    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    stats["sum_squares"] += float(np.dot(values, values))
+    stats["sample_count"] += int(values.size)
+    stats["peak"] = max(stats["peak"], float(np.max(np.abs(values))))
 
 
 _NANOSECONDS_PER_SAMPLE = 1_000_000_000 / SAMPLE_RATE
@@ -373,13 +414,13 @@ def _mac_audio_stderr(process, stop_event, error_queue):
             if not line:
                 continue
             if line == "MEETING_AUDIO_READY":
-                print("🔊 Audio del sistema macOS capturado")
+                print("🔊 Captura de ScreenCaptureKit iniciada")
             elif line == "MEETING_AUDIO_MIC_ENABLED":
                 print("🎤 Captura nativa del micrófono macOS habilitada")
             elif line == "MEETING_AUDIO_MIC_READY":
-                print("🎤 Recibiendo muestras del micrófono macOS")
+                print("🎤 Llegaron paquetes iniciales del micrófono macOS")
             elif line == "MEETING_AUDIO_SAMPLE_READY":
-                print("🔊 Recibiendo muestras de audio del sistema")
+                print("🔊 Llegaron paquetes iniciales del sistema macOS")
             elif line.startswith("ERROR:"):
                 error_queue.put(RuntimeError(line))
                 stop_event.set()
@@ -423,9 +464,9 @@ def _mac_audio_reader(
                 np.float32,
                 copy=True,
             )
-            start_ns = timestamp_ns - int(
-                round(len(samples) * _NANOSECONDS_PER_SAMPLE)
-            )
+            # The native helper timestamps the packet at its estimated start
+            # (callback time minus packet duration); keep that start unchanged.
+            start_ns = timestamp_ns
             if source_name == "microphone":
                 native_microphone_ready.set()
             source_queue.put((source_name, start_ns, samples))
@@ -458,18 +499,76 @@ def _stop_mac_audio_process(process):
         process.wait(timeout=5)
 
 
-def macos_audio_capture(stop_event, error_queue):
-    """Capture macOS system audio and microphone without temporary WAV files."""
+def macos_audio_capture(stop_event, error_queue, capture_done=None):
+    """Capture and mix macOS audio into the in-memory transcription queue."""
     source_queue = queue.Queue()
     source_buffers = {
         "system": _TimestampedAudioBuffer(),
         "microphone": _TimestampedAudioBuffer(),
+    }
+    audio_level_stats = {
+        source: _empty_audio_level_stats()
+        for source in ("system", "microphone", "mezcla")
+    }
+    coverage_stats = {
+        source: {"covered": 0, "missing": 0}
+        for source in ("system", "microphone")
     }
     process = None
     reader_thread = None
     stderr_thread = None
     native_microphone_ready = threading.Event()
     reader_finished = threading.Event()
+    next_audio_report_ns = (
+        time.monotonic_ns() + MAC_AUDIO_DIAGNOSTIC_SECONDS * 1_000_000_000
+    )
+
+    def report_audio_levels():
+        labels = {
+            "system": "audio del sistema",
+            "microphone": "micrófono",
+            "mezcla": "mezcla enviada al transcriptor",
+        }
+        for source, label in labels.items():
+            stats = audio_level_stats[source]
+            sample_count = stats["sample_count"]
+            expected_frames = (
+                coverage_stats[source]["covered"] + coverage_stats[source]["missing"]
+                if source in coverage_stats
+                else 0
+            )
+            if not sample_count and not expected_frames:
+                continue
+
+            rms = (
+                float(np.sqrt(stats["sum_squares"] / sample_count))
+                if sample_count
+                else 0.0
+            )
+            coverage = ""
+            if source in coverage_stats and expected_frames:
+                coverage_percent = (
+                    100.0 * coverage_stats[source]["covered"] / expected_frames
+                )
+                coverage = f"; cobertura temporal={coverage_percent:.1f}%"
+            print(
+                f"📊 Nivel macOS ({label}): RMS={rms:.6f}; "
+                f"pico={stats['peak']:.6f}; "
+                f"muestras={sample_count / SAMPLE_RATE:.1f}s{coverage}"
+            )
+            if source == "system" and rms < 0.001:
+                print(
+                    "⚠️ El audio del sistema está casi silencioso; si hay voces en "
+                    "la reunión, revisa la salida/captura de audio de macOS."
+                )
+            elif source == "microphone" and rms < 0.005:
+                print(
+                    "⚠️ El nivel del micrófono está bajo; si estabas hablando, "
+                    "revisa el micrófono seleccionado y su nivel de entrada."
+                )
+            audio_level_stats[source] = _empty_audio_level_stats()
+            if source in coverage_stats:
+                coverage_stats[source] = {"covered": 0, "missing": 0}
 
     def microphone_callback(indata, frames, time_info, status):
         if status:
@@ -507,6 +606,12 @@ def macos_audio_capture(stop_event, error_queue):
             ].read_window(mix_next_ns, MAC_AUDIO_MIX_FRAMES)
             missing_system_frames += MAC_AUDIO_MIX_FRAMES - system_covered
             missing_microphone_frames += MAC_AUDIO_MIX_FRAMES - microphone_covered
+            coverage_stats["system"]["covered"] += system_covered
+            coverage_stats["system"]["missing"] += MAC_AUDIO_MIX_FRAMES - system_covered
+            coverage_stats["microphone"]["covered"] += microphone_covered
+            coverage_stats["microphone"]["missing"] += (
+                MAC_AUDIO_MIX_FRAMES - microphone_covered
+            )
 
             if system_covered or microphone_covered:
                 mixed = np.nan_to_num(
@@ -519,6 +624,7 @@ def macos_audio_capture(stop_event, error_queue):
                 peak = np.max(np.abs(mixed)) if mixed.size else 0.0
                 if peak > 1.0:
                     mixed = mixed / peak
+                _accumulate_audio_level(audio_level_stats["mezcla"], mixed)
                 audio_queue.put(mixed.reshape(-1, 1))
 
             mix_next_ns = window_end_ns
@@ -584,6 +690,7 @@ def macos_audio_capture(stop_event, error_queue):
                 try:
                     source, start_ns, samples = source_queue.get(timeout=0.05)
                     source_buffers[source].append(start_ns, samples)
+                    _accumulate_audio_level(audio_level_stats[source], samples)
                     if mix_next_ns is None:
                         first_starts = [
                             buffer.first_start_ns
@@ -611,6 +718,13 @@ def macos_audio_capture(stop_event, error_queue):
                 )
                 missing_system_frames += missing_system
                 missing_microphone_frames += missing_microphone
+
+                now_ns = time.monotonic_ns()
+                if now_ns >= next_audio_report_ns:
+                    report_audio_levels()
+                    next_audio_report_ns = (
+                        now_ns + MAC_AUDIO_DIAGNOSTIC_SECONDS * 1_000_000_000
+                    )
 
                 if stop_event.is_set() and source_queue.empty():
                     if not stop_process_requested:
@@ -643,6 +757,9 @@ def macos_audio_capture(stop_event, error_queue):
             reader_thread.join(timeout=2)
         if stderr_thread is not None:
             stderr_thread.join(timeout=2)
+        report_audio_levels()
+        if capture_done is not None:
+            capture_done.set()
 
 
 def windows_audio_capture(stop_event, error_queue, capture_done):
@@ -689,20 +806,28 @@ def main_windows(file_path):
 
 def main_macos(file_path):
     stop_event = threading.Event()
+    capture_done = threading.Event()
     error_queue = queue.Queue()
     capture_thread = threading.Thread(
         target=macos_audio_capture,
-        args=(stop_event, error_queue),
+        args=(stop_event, error_queue, capture_done),
         name="macos-audio-capture",
         daemon=True,
     )
-    capture_thread.start()
+    def request_stop(signum, frame):
+        if not stop_event.is_set():
+            print("\n🧠 Finalizando reunión; guardando el último bloque incompleto...")
+            stop_event.set()
 
+    previous_handler = signal.signal(signal.SIGINT, request_stop)
     try:
-        transcriber_loop(file_path, stop_event=stop_event)
+        capture_thread.start()
+        transcriber_loop(file_path, stop_event=stop_event, capture_done=capture_done)
     finally:
         stop_event.set()
-        capture_thread.join(timeout=10)
+        if capture_thread.ident is not None:
+            capture_thread.join(timeout=10)
+        signal.signal(signal.SIGINT, previous_handler)
 
     if not error_queue.empty():
         error = error_queue.get()
@@ -713,18 +838,20 @@ def main():
     file_path = os.path.join(OBSIDIAN_DIR, NOTE_TITLE)
     write_header(file_path)
 
-    if os.name == "nt":
+    try:
+        if os.name == "nt":
+            print(f"📂 Guardando en: {file_path}")
+            print("🎙️ Capturando micrófono y audio del sistema... Ctrl+C para terminar\n")
+            main_windows(file_path)
+            print("\n🛑 Reunión finalizada")
+            return
+
         print(f"📂 Guardando en: {file_path}")
-        print("🎙️ Capturando micrófono y audio del sistema... Ctrl+C para terminar\n")
-        main_windows(file_path)
+        print("🎙️ Capturando micrófono + audio del sistema... Ctrl+C para terminar\n")
+        main_macos(file_path)
         print("\n🛑 Reunión finalizada")
-        return
-
-    print(f"📂 Guardando en: {file_path}")
-    print("🎙️ Capturando micrófono + audio del sistema... Ctrl+C para terminar\n")
-    main_macos(file_path)
-
-    print("\n🛑 Reunión finalizada")
+    finally:
+        transcriber.close()
 
 if __name__ == "__main__":
     main()

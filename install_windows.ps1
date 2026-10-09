@@ -3,6 +3,11 @@ $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectDir
 
+$OsArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+if ($OsArchitecture -ne "X64") {
+    throw "Este instalador requiere Windows x64; arquitectura detectada: $OsArchitecture."
+}
+
 function Get-PythonCommand {
     $commands = @()
     foreach ($name in @("py", "python", "python3")) {
@@ -74,7 +79,50 @@ if (-not (Test-Path (Join-Path $ProjectDir ".env"))) {
     Write-Host "Creado .env con la configuración predeterminada de Windows."
 }
 
-Write-Host "Descargando y verificando el modelo Whisper..."
+Write-Host "Descargando el modelo local Cactus Whistle..."
+$ModelDir = Join-Path $ProjectDir "models"
+$WhistleModel = Join-Path $ModelDir "whistle.cact"
+$WhistleSha256 = "b6e02f048568ac5d01a2042556c658061e699acbc0aa2a1439f52f3d461dffeb"
+$WhistleUrl = "https://huggingface.co/Cactus-Compute/whistle/resolve/b358ddadd89b7a713b5aa131f23032d3cca1b251/whistle.cact"
+New-Item -ItemType Directory -Force -Path $ModelDir | Out-Null
+$CurrentWhistleHash = if (Test-Path $WhistleModel) {
+    (Get-FileHash -Algorithm SHA256 -LiteralPath $WhistleModel).Hash.ToLowerInvariant()
+} else {
+    ""
+}
+if ($CurrentWhistleHash -ne $WhistleSha256) {
+    $TemporaryWhistle = "$WhistleModel.$([guid]::NewGuid().ToString('N')).download"
+    $Curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if (-not $Curl) {
+        throw "No se encontró curl.exe, necesario para descargar whistle.cact."
+    }
+    & $Curl.Source --fail --location --retry 3 --output $TemporaryWhistle $WhistleUrl
+    if ($LASTEXITCODE -ne 0) {
+        throw "No se pudo descargar Cactus Whistle."
+    }
+    $DownloadedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $TemporaryWhistle).Hash.ToLowerInvariant()
+    if ($DownloadedHash -ne $WhistleSha256) {
+        throw "La verificación SHA-256 de whistle.cact falló. Archivo temporal: $TemporaryWhistle"
+    }
+    Move-Item -LiteralPath $TemporaryWhistle -Destination $WhistleModel -Force
+}
+Write-Host "Verificando el runtime Needle local..."
+$env:NEEDLE_TELEMETRY = "0"
+$env:DO_NOT_TRACK = "1"
+$NeedleCli = Join-Path $ProjectDir "venv\Scripts\needle.exe"
+if (-not (Test-Path $NeedleCli)) {
+    throw "No se encontró el comando needle del entorno virtual."
+}
+& $NeedleCli fetch
+if ($LASTEXITCODE -ne 0) {
+    throw "No se pudo preparar el runtime local Needle."
+}
+& $VenvPython -c "from transcription_engines import WhistleTranscriber; engine = WhistleTranscriber(language='es'); engine.close(); print('Cactus Whistle listo.')"
+if ($LASTEXITCODE -ne 0) {
+    throw "No se pudo cargar el modelo Cactus Whistle local."
+}
+
+Write-Host "Descargando y verificando Whisper de respaldo..."
 & $VenvPython -c "from dotenv import load_dotenv; import os; from faster_whisper import WhisperModel; load_dotenv('.env'); name = os.getenv('WINDOWS_WHISPER_MODEL', '').strip() or 'small'; print(f'Modelo Windows: {name}'); WhisperModel(name, device='cpu', compute_type='int8'); print('Modelo listo.')"
 if ($LASTEXITCODE -ne 0) {
     throw "No se pudo descargar o cargar el modelo Whisper."
