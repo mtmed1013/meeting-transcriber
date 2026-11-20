@@ -45,6 +45,9 @@ const LOG_TAIL_LINES: usize = 5;
 const AI_FAILURE_SEPARATOR: &str = "\n\n---\n\n";
 const AI_FAILURE_PREFIX: &str = "⚠️ Reporte IA no generado: ";
 const LLAMA_RELEASE_URL: &str = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
+/// Newest first. `latest` can point at a nightly-only tag, so the build-tagged releases are read too.
+const LLAMA_RELEASES_URL: &str =
+    "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30";
 const LLAMA_ASSET_PREFIX: &str = "llama-";
 const LLAMA_SERVER_EXE: &str = if cfg!(windows) {
     "llama-server.exe"
@@ -112,6 +115,7 @@ struct RuntimeProgress {
 /// The fields of a GitHub release this module reads.
 #[derive(Debug, Deserialize)]
 struct Release {
+    tag_name: String,
     assets: Vec<ReleaseAsset>,
 }
 
@@ -436,6 +440,7 @@ pub fn runtime_kind_for(platform: Platform) -> LocalRuntimeKind {
 fn gguf_asset_suffixes(platform: Platform) -> &'static [&'static str] {
     match (platform.os, platform.arch) {
         ("windows", "x86_64") => &["bin-win-cpu-x64.zip"],
+        ("windows", "aarch64") => &["bin-win-cpu-arm64.zip"],
         ("macos", "x86_64") => &["bin-macos-x64.tar.gz", "bin-macos-x64.zip"],
         ("macos", "aarch64") => &["bin-macos-arm64.tar.gz"],
         _ => &[],
@@ -456,6 +461,42 @@ fn select_asset<'a>(assets: &'a [ReleaseAsset], suffixes: &[&str]) -> Option<&'a
             asset.name.starts_with(LLAMA_ASSET_PREFIX) && asset.name.ends_with(suffix)
         })
     })
+}
+
+/// The first release, newest first, that has a matching asset. Suffixes keep their preference order
+/// inside each release.
+fn pick_release<'a>(
+    releases: &'a [Release],
+    suffixes: &[&str],
+) -> Option<(&'a Release, &'a ReleaseAsset)> {
+    releases
+        .iter()
+        .find_map(|release| select_asset(&release.assets, suffixes).map(|asset| (release, asset)))
+}
+
+/// Tags of the releases that were inspected, in API order, each listed once.
+fn inspected_tags(releases: &[Release]) -> Vec<&str> {
+    let mut tags: Vec<&str> = Vec::new();
+    for release in releases {
+        if !tags.contains(&release.tag_name.as_str()) {
+            tags.push(&release.tag_name);
+        }
+    }
+    tags
+}
+
+fn missing_binary_message(platform: Platform, suffixes: &[&str], tags: &[&str]) -> String {
+    let inspected = if tags.is_empty() {
+        "ninguno".to_string()
+    } else {
+        tags.join(", ")
+    };
+    format!(
+        "No hay un binario de llama.cpp para {}/{} (sufijos probados: {}; releases revisados: {inspected})",
+        platform.os,
+        platform.arch,
+        suffixes.join(", "),
+    )
 }
 
 /// Folder of the local runtime. The managed MLX layout belongs to `mlx_runtime`.
@@ -733,15 +774,18 @@ async fn install_gguf(app: &AppHandle, root: &Path, platform: Platform) -> Resul
         .user_agent(concat!("meeting-transcriber/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|err| format!("No se pudo preparar la descarga: {err}"))?;
-    let release = fetch_latest_release(&client).await?;
-    let asset = select_asset(&release.assets, suffixes)
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "No hay un binario de llama.cpp para {}/{}.",
-                platform.os, platform.arch
-            )
-        })?;
+    let latest = fetch_latest_release(&client).await?;
+    let asset = match select_asset(&latest.assets, suffixes) {
+        Some(asset) => asset.clone(),
+        None => {
+            let releases = fetch_releases(&client).await?;
+            pick_release(&releases, suffixes)
+                .map(|(_, asset)| asset.clone())
+                .ok_or_else(|| {
+                    missing_binary_message(platform, suffixes, &inspected_tags(&releases))
+                })?
+        }
+    };
 
     fs::create_dir_all(root).map_err(io_error)?;
     let archive = root.join(format!(".download-{}-{}", unique_suffix(), asset.name));
@@ -757,14 +801,26 @@ async fn install_gguf(app: &AppHandle, root: &Path, platform: Platform) -> Resul
 }
 
 async fn fetch_latest_release(client: &reqwest::Client) -> Result<Release, String> {
+    fetch_github_json(client, LLAMA_RELEASE_URL).await
+}
+
+/// The build-tagged llama.cpp releases, newest first.
+async fn fetch_releases(client: &reqwest::Client) -> Result<Vec<Release>, String> {
+    fetch_github_json(client, LLAMA_RELEASES_URL).await
+}
+
+async fn fetch_github_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<T, String> {
     client
-        .get(LLAMA_RELEASE_URL)
+        .get(url)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
         .map_err(|err| format!("No se pudo consultar llama.cpp en GitHub: {err}"))?
-        .json::<Release>()
+        .json::<T>()
         .await
         .map_err(|err| format!("Respuesta inesperada de GitHub: {err}"))
 }
@@ -1271,7 +1327,102 @@ mod tests {
         assert!(!can_install(LocalRuntimeKind::Mlx, WINDOWS_X64));
         assert!(can_install(LocalRuntimeKind::Gguf, WINDOWS_X64));
         assert!(can_install(LocalRuntimeKind::Gguf, MAC_INTEL));
-        assert!(!can_install(LocalRuntimeKind::Gguf, WINDOWS_ARM));
+        assert!(can_install(LocalRuntimeKind::Gguf, WINDOWS_ARM));
+    }
+
+    fn release(tag: &str, names: &[&str]) -> Release {
+        Release {
+            tag_name: tag.to_string(),
+            assets: names.iter().map(|name| asset(name)).collect(),
+        }
+    }
+
+    #[test]
+    fn the_windows_binary_is_found_in_the_build_tagged_release_when_latest_is_nightly_only() {
+        let releases = vec![
+            release("v1.0.0", &["nightly-tag.txt"]),
+            release(
+                "b12569",
+                &[
+                    "llama-b12569-bin-win-cpu-x64.zip",
+                    "llama-b12569-bin-win-cuda-x64.zip",
+                ],
+            ),
+            release("b12500", &["llama-b12500-bin-win-cpu-x64.zip"]),
+        ];
+
+        let (found, picked) = pick_release(&releases, gguf_asset_suffixes(WINDOWS_X64))
+            .expect("the b12569 release has a Windows x64 CPU build");
+        assert_eq!(found.tag_name, "b12569");
+        assert_eq!(picked.name, "llama-b12569-bin-win-cpu-x64.zip");
+    }
+
+    #[test]
+    fn pick_release_returns_none_when_no_release_has_a_matching_asset() {
+        let releases = vec![
+            release("v1.0.0", &["nightly-tag.txt"]),
+            release("b12569", &["llama-b12569-bin-win-cuda-x64.zip"]),
+        ];
+
+        assert!(pick_release(&releases, gguf_asset_suffixes(WINDOWS_X64)).is_none());
+    }
+
+    #[test]
+    fn pick_release_prefers_the_suffix_order_inside_one_release() {
+        // The zip is listed first, but the tarball is the more preferred suffix for macOS Intel.
+        let releases = vec![release(
+            "b12569",
+            &[
+                "llama-b12569-bin-macos-x64.zip",
+                "llama-b12569-bin-macos-x64.tar.gz",
+            ],
+        )];
+
+        let (_, picked) = pick_release(&releases, gguf_asset_suffixes(MAC_INTEL)).unwrap();
+        assert_eq!(picked.name, "llama-b12569-bin-macos-x64.tar.gz");
+    }
+
+    #[test]
+    fn gguf_asset_suffixes_cover_windows_and_macos_and_nothing_else() {
+        const LINUX_X64: Platform = Platform {
+            os: "linux",
+            arch: "x86_64",
+        };
+
+        assert_eq!(gguf_asset_suffixes(WINDOWS_X64), &["bin-win-cpu-x64.zip"]);
+        assert_eq!(gguf_asset_suffixes(WINDOWS_ARM), &["bin-win-cpu-arm64.zip"]);
+        assert_eq!(
+            gguf_asset_suffixes(MAC_INTEL),
+            &["bin-macos-x64.tar.gz", "bin-macos-x64.zip"]
+        );
+        assert_eq!(gguf_asset_suffixes(MAC_ARM), &["bin-macos-arm64.tar.gz"]);
+        assert!(gguf_asset_suffixes(LINUX_X64).is_empty());
+    }
+
+    #[test]
+    fn the_missing_binary_error_names_the_platform_suffixes_and_inspected_tags() {
+        let releases = vec![
+            release("v1.0.0", &["nightly-tag.txt"]),
+            release("b12569", &["llama-b12569-bin-win-cuda-x64.zip"]),
+        ];
+        let tags = inspected_tags(&releases);
+        assert_eq!(tags, vec!["v1.0.0", "b12569"]);
+
+        assert_eq!(
+            missing_binary_message(WINDOWS_X64, gguf_asset_suffixes(WINDOWS_X64), &tags),
+            "No hay un binario de llama.cpp para windows/x86_64 (sufijos probados: bin-win-cpu-x64.zip; releases revisados: v1.0.0, b12569)"
+        );
+    }
+
+    #[test]
+    fn inspected_tags_lists_each_release_once_in_api_order() {
+        let releases = vec![
+            release("b12569", &[]),
+            release("b12568", &[]),
+            release("b12569", &[]),
+        ];
+
+        assert_eq!(inspected_tags(&releases), vec!["b12569", "b12568"]);
     }
 
     #[test]

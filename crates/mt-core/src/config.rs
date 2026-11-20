@@ -533,7 +533,25 @@ UNKNOWN_KEY=whatever
         assert_eq!(s.output_dir, PathBuf::from("/vault/quoted path"));
         assert_eq!(s.windows_microphone, "Mic 1");
         assert_eq!(s.windows_speaker, "Spk");
-        assert_eq!(s.whisper_model, WhisperSize::Medium);
+        // Windows reads WINDOWS_WHISPER_MODEL only, exactly like the Python engine, so a plain
+        // WHISPER_MODEL line does not apply there.
+        let expected = if cfg!(windows) {
+            WhisperSize::Small
+        } else {
+            WhisperSize::Medium
+        };
+        assert_eq!(s.whisper_model, expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dotenv_windows_prefers_its_own_whisper_key_over_the_plain_one() {
+        let mut s = base();
+        import_dotenv(
+            "WHISPER_MODEL=medium\nWINDOWS_WHISPER_MODEL=base\n",
+            &mut s,
+        );
+        assert_eq!(s.whisper_model, WhisperSize::Base);
     }
 
     #[test]

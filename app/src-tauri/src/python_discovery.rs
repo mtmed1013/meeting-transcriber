@@ -15,6 +15,11 @@ pub const MIN_PYTHON_MINOR: u32 = 10;
 pub const MLX_PYTHON_MINOR: u32 = 11;
 /// Minor versions preferred over any other accepted version.
 const PREFERRED_MINOR_VERSIONS: std::ops::RangeInclusive<u32> = 11..=14;
+/// Windows guidance shown when no compatible interpreter is found. It covers the Microsoft Store
+/// App Execution Alias, which opens the Store instead of running Python.
+const WINDOWS_PYTHON_HINT: &str = "Instálalo desde python.org o con winget (winget install Python.Python.3.12), y desactiva el alias en Configuración → Aplicaciones → Alias de ejecución de aplicaciones.";
+/// Rejection detail for a Microsoft Store App Execution Alias candidate.
+const STORE_ALIAS_DETAIL: &str = "alias de Microsoft Store; instala Python desde python.org";
 
 const PYTHON_PROBE: &str = "import json, platform, sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'executable': sys.executable}))";
 const VERSIONED_EXECUTABLES: &[&str] = &[
@@ -131,13 +136,14 @@ fn platform_candidates() -> Vec<Candidate> {
     )
 }
 
+/// Order: the `py` launcher, then real installs under `%LOCALAPPDATA%` and `%ProgramFiles%`, and
+/// finally whatever `PATH` offers. Store aliases are filtered out later by [`is_store_alias`].
 #[cfg(windows)]
 fn platform_candidates() -> Vec<Candidate> {
-    let mut candidates = Vec::new();
-    let path = env::var_os("PATH").unwrap_or_default();
-    for directory in env::split_paths(&path) {
-        add_executables_in(&mut candidates, &directory);
-    }
+    let mut candidates = vec![Candidate {
+        program: PathBuf::from("py"),
+        launcher_args: vec!["-3".into()],
+    }];
 
     let local_programs = env::var_os("LOCALAPPDATA")
         .map(|local| PathBuf::from(local).join("Programs").join("Python"));
@@ -146,10 +152,14 @@ fn platform_candidates() -> Vec<Candidate> {
         add_python3_installations(&mut candidates, &root);
     }
 
-    candidates.push(Candidate {
-        program: PathBuf::from("py"),
-        launcher_args: vec!["-3".into()],
-    });
+    let path = env::var_os("PATH").unwrap_or_default();
+    for directory in env::split_paths(&path) {
+        // The Microsoft Store alias directory only holds launchers that fail to build a venv.
+        if is_store_alias(&directory) {
+            continue;
+        }
+        add_executables_in(&mut candidates, &directory);
+    }
     deduplicate_candidates(candidates)
 }
 
@@ -235,6 +245,14 @@ fn add_python3_installations(candidates: &mut Vec<Candidate>, root: &Path) {
             candidates.push(Candidate::direct(executable));
         }
     }
+}
+
+/// Whether `path` lies under a `WindowsApps` folder (case-insensitive). That folder holds the
+/// Microsoft Store App Execution Aliases, which open the Store instead of running Python.
+fn is_store_alias(path: &Path) -> bool {
+    path.to_string_lossy()
+        .to_ascii_lowercase()
+        .contains(r"\windowsapps\")
 }
 
 fn add_executables_in(candidates: &mut Vec<Candidate>, directory: &Path) {
@@ -352,6 +370,13 @@ where
 
     for (order, candidate) in deduplicate_candidates(candidates).into_iter().enumerate() {
         let label = candidate.label();
+        if is_store_alias(&candidate.program) {
+            rejected.push(format!(
+                "{}: {STORE_ALIAS_DETAIL}",
+                candidate.program.display()
+            ));
+            continue;
+        }
         let result = match probe(&candidate) {
             Ok(result) => result,
             Err(error) => {
@@ -359,6 +384,15 @@ where
                 continue;
             }
         };
+        // The `py` launcher and a PATH shim can resolve to the Store package itself.
+        if result
+            .executable
+            .as_deref()
+            .is_some_and(|executable| is_store_alias(Path::new(executable)))
+        {
+            rejected.push(format!("{label}: {STORE_ALIAS_DETAIL}"));
+            continue;
+        }
         let version = PythonVersion {
             major: result.version[0],
             minor: result.version[1],
@@ -424,7 +458,7 @@ fn no_compatible_python_error(host_arch: &str, minimum_minor: u32, rejected: &[S
     let hint = if cfg!(target_os = "macos") {
         "Instala Python desde Homebrew (brew install python@3.12).".to_string()
     } else if cfg!(windows) {
-        "Instálalo desde python.org o con winget (winget install Python.Python.3.12).".to_string()
+        WINDOWS_PYTHON_HINT.to_string()
     } else {
         format!("Instala Python 3.{minimum_minor} o superior.")
     };
@@ -686,6 +720,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_launcher_that_resolves_to_the_store_package_is_rejected() {
+        let candidates = vec![
+            Candidate::direct(PathBuf::from("py")),
+            Candidate::direct(PathBuf::from("/usr/local/bin/python3.12")),
+        ];
+        let selected = select_python_at_least(
+            candidates,
+            |candidate| {
+                let executable = if candidate.program == Path::new("py") {
+                    r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\python.exe"
+                } else {
+                    "/usr/local/bin/python3.12"
+                };
+                Ok(ProbeResult {
+                    version: [3, 12, 4],
+                    machine: "arm64".to_string(),
+                    executable: Some(executable.to_string()),
+                })
+            },
+            "aarch64",
+            11,
+        )
+        .expect("the real interpreter is used");
+        assert_eq!(selected.executable, PathBuf::from("/usr/local/bin/python3.12"));
+    }
+
+    #[test]
     fn deduplicates_symlink_aliases_to_the_same_interpreter() {
         let scratch = tempfile::tempdir().unwrap();
         let real = scratch.path().join("python3.14");
@@ -815,6 +876,55 @@ mod tests {
         .unwrap();
         assert_eq!(selected.version.minor, 11);
         assert_eq!(selected.executable, PathBuf::from("/fake/3.11"));
+    }
+
+    #[test]
+    fn detects_microsoft_store_alias_paths_case_insensitively() {
+        assert!(is_store_alias(Path::new(
+            r"C:\Users\Hp\AppData\Local\Microsoft\WindowsApps\python.exe"
+        )));
+        assert!(is_store_alias(Path::new(
+            r"c:\users\hp\appdata\local\microsoft\windowsapps\PYTHON.EXE"
+        )));
+        assert!(is_store_alias(Path::new(
+            r"\\?\C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12\python.exe"
+        )));
+        assert!(!is_store_alias(Path::new(
+            r"C:\Users\Hp\AppData\Local\Programs\Python\Python312\python.exe"
+        )));
+        assert!(!is_store_alias(Path::new("/usr/bin/python3")));
+        assert!(!is_store_alias(Path::new("/home/u/windowsapps/python3")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_microsoft_store_alias_before_probing_it() {
+        let alias = PathBuf::from(r"C:\Users\Hp\AppData\Local\Microsoft\WindowsApps\python.exe");
+        let error = select_python(
+            vec![Candidate::direct(alias.clone())],
+            |_| unreachable!("the Store alias must not be probed"),
+            "x86_64",
+        )
+        .unwrap_err();
+
+        assert!(error.contains(&format!(
+            "{}: alias de Microsoft Store; instala Python desde python.org",
+            alias.display()
+        )));
+    }
+
+    #[test]
+    fn windows_hint_points_to_python_org_winget_and_the_alias_setting() {
+        for fragment in [
+            "python.org",
+            "winget install Python.Python.3.12",
+            "Configuración → Aplicaciones → Alias de ejecución de aplicaciones",
+        ] {
+            assert!(
+                WINDOWS_PYTHON_HINT.contains(fragment),
+                "{WINDOWS_PYTHON_HINT}"
+            );
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,6 +35,8 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// Trailing output lines quoted when a streamed command fails.
 const FAILURE_TAIL_LINES: usize = 5;
 const RUNTIME_DIR: &str = "python-runtime";
+/// Official bootstrap script for pip, the last resort when every venv path leaves pip missing.
+const GET_PIP_URL: &str = "https://bootstrap.pypa.io/get-pip.py";
 const MODELS_DIR: &str = "stt-models";
 /// Exit 0 only when the selected faster-whisper model is already in the local cache.
 const WHISPER_CACHE_CHECK: &str = "import os, sys; os.environ['HF_HUB_OFFLINE'] = '1'; from faster_whisper.utils import download_model; sys.exit(0 if download_model(sys.argv[1], local_files_only=True) else 1)";
@@ -447,17 +449,140 @@ fn create_venv(runtime_dir: &Path) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(io_error)?;
     }
     let interpreter = crate::python_discovery::discover_python()?;
-    let mut command = hidden_command(&interpreter.executable);
-    command.args(["-m", "venv"]).arg(runtime_dir);
-    run_checked(command, "La creación del entorno Python")?;
+    provision_venv(&interpreter.executable, runtime_dir, GET_PIP_URL)
+}
 
-    let venv_python = runtime_dir.join(python_relative());
-    if !python_check(&venv_python, "import pip", &[], &[]) {
-        let mut command = hidden_command(&venv_python);
-        command.args(["-m", "ensurepip", "--upgrade"]);
-        run_checked(command, "La instalación de pip en el entorno Python")?;
+/// Builds the venv with a fallback chain, so a broken `ensurepip` (typical of the Microsoft Store
+/// Python) does not abort the install. On total failure the error names the base interpreter, the
+/// venv folder, and the last stderr line of every attempt, and the half-built folder is removed.
+fn provision_venv(base: &Path, runtime_dir: &Path, get_pip_url: &str) -> Result<(), String> {
+    let mut causes = Vec::new();
+    if build_venv(base, runtime_dir, get_pip_url, &mut causes) {
+        return Ok(());
     }
-    Ok(())
+    let _ = fs::remove_dir_all(runtime_dir);
+    Err(format!(
+        "La creación del entorno Python falló (intérprete base {}, entorno {}): {}",
+        base.display(),
+        runtime_dir.display(),
+        causes.join("; ")
+    ))
+}
+
+/// Runs the attempts in order until `import pip` succeeds in the venv. Each failed attempt pushes
+/// its cause onto `causes`. Returns whether the venv ends with a working pip.
+fn build_venv(
+    base: &Path,
+    runtime_dir: &Path,
+    get_pip_url: &str,
+    causes: &mut Vec<String>,
+) -> bool {
+    let venv_python = runtime_dir.join(python_relative());
+
+    // 1. Standard venv. 2. If it fails, retry without pip and bootstrap pip with ensurepip.
+    let mut command = hidden_command(base);
+    command.args(["-m", "venv"]).arg(runtime_dir);
+    if !run_step(causes, "venv", command) {
+        let _ = fs::remove_dir_all(runtime_dir);
+        let mut command = hidden_command(base);
+        command
+            .args(["-m", "venv", "--without-pip"])
+            .arg(runtime_dir);
+        if !run_step(causes, "venv --without-pip", command) {
+            return false;
+        }
+    }
+    if pip_importable(&venv_python) {
+        return true;
+    }
+    let mut command = hidden_command(&venv_python);
+    command.args(["-m", "ensurepip", "--upgrade", "--default-pip"]);
+    run_step(causes, "ensurepip", command);
+    if pip_importable(&venv_python) {
+        return true;
+    }
+
+    // 3. Install pip into the venv's site-packages with the base interpreter.
+    let mut command = hidden_command(base);
+    command
+        .args(["-m", "pip", "install", "--upgrade", "--target"])
+        .arg(venv_site_packages(runtime_dir))
+        .arg("pip");
+    run_step(causes, "pip install --target", command);
+    if pip_importable(&venv_python) {
+        return true;
+    }
+
+    // 4. Last resort: official get-pip.py, run by the venv interpreter, then deleted.
+    let script = env::temp_dir().join(format!("get-pip-{}.py", unique_suffix()));
+    let mut download = hidden_command(if cfg!(windows) { "curl.exe" } else { "curl" });
+    download
+        .args(["-fsSL", "--output"])
+        .arg(&script)
+        .arg(get_pip_url);
+    if run_step(causes, "descarga de get-pip.py", download) {
+        let mut command = hidden_command(&venv_python);
+        command.arg(&script);
+        run_step(causes, "get-pip.py", command);
+    }
+    let _ = fs::remove_file(&script);
+
+    // 5. Final proof: pip must import in the venv.
+    let mut check = hidden_command(&venv_python);
+    check.args(["-c", "import pip"]);
+    run_step(causes, "import pip", check)
+}
+
+/// Whether `import pip` succeeds silently in `python`.
+fn pip_importable(python: &Path) -> bool {
+    python_check(python, "import pip", &[], &[])
+}
+
+/// Records a failed attempt in `causes` with the last non-empty stderr line. Returns whether the
+/// attempt succeeded.
+fn run_step(causes: &mut Vec<String>, step: &str, mut command: Command) -> bool {
+    match command.stdin(Stdio::null()).output() {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            let line = last_stderr_line(&output.stderr, output.status);
+            causes.push(format!("{step}: {line}"));
+            false
+        }
+        Err(error) => {
+            causes.push(format!("{step}: no se pudo ejecutar ({error})"));
+            false
+        }
+    }
+}
+
+/// Last non-empty stderr line, or the exit status when stderr is silent.
+fn last_stderr_line(stderr: &[u8], status: ExitStatus) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .map_or_else(|| format!("terminó con {status}"), str::to_string)
+}
+
+/// The venv's `site-packages`: `Lib\site-packages` on Windows, `lib/python3.*/site-packages` elsewhere.
+fn venv_site_packages(runtime_dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        return runtime_dir.join("Lib").join("site-packages");
+    }
+    let lib = runtime_dir.join("lib");
+    let python_dir = fs::read_dir(&lib).ok().and_then(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with("python3"))
+            })
+    });
+    python_dir
+        .unwrap_or_else(|| lib.join("python3"))
+        .join("site-packages")
 }
 
 /// Packages the selected engine needs, plus `librosa` for speaker markers. The other engine's
@@ -1145,5 +1270,132 @@ mod tests {
         let error = stream_command(command, "Prueba", |_| {}).unwrap_err();
 
         assert!(error.starts_with("Prueba no pudo ejecutarse"), "{error}");
+    }
+
+    /// Missing on purpose: `file://` fails locally, so the last-resort download never uses network.
+    #[cfg(unix)]
+    const MISSING_GET_PIP_URL: &str = "file:///meeting-transcriber-test/missing-get-pip.py";
+
+    /// Writes a fake `python3` shell script that logs each call to `log`. Its `-m venv` creates the
+    /// venv folder and then fails like a broken `ensurepip`. The venv interpreter is a symlink to the
+    /// same script, so `ensurepip` and `import pip` either succeed or fail as the test needs.
+    #[cfg(unix)]
+    fn fake_base_interpreter(dir: &Path, log: &Path, ensurepip_works: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let marker = dir.join("pip-ready");
+        let ensurepip = if ensurepip_works {
+            format!("  touch '{}'\n  exit 0\n", marker.display())
+        } else {
+            "  echo 'ensurepip: Access is denied' >&2\n  exit 1\n".to_string()
+        };
+        let script = format!(
+            "#!/bin/sh\n\
+             echo \"$*\" >> '{log}'\n\
+             if [ \"$1\" = \"-c\" ]; then\n\
+               if [ -f '{marker}' ]; then exit 0; fi\n\
+               echo \"No module named 'pip'\" >&2\n\
+               exit 1\n\
+             fi\n\
+             if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"venv\" ]; then\n\
+               if [ \"$3\" = \"--without-pip\" ]; then\n\
+                 mkdir -p \"$4/bin\" \"$4/lib/python3.12/site-packages\" && ln -sf \"$0\" \"$4/bin/python\" && exit 0\n\
+                 exit 1\n\
+               fi\n\
+               mkdir -p \"$3/bin\" && ln -sf \"$0\" \"$3/bin/python\"\n\
+               echo 'ensurepip: Access is denied' >&2\n\
+               exit 1\n\
+             fi\n\
+             if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"ensurepip\" ]; then\n\
+             {ensurepip}\
+             fi\n\
+             echo \"pip: No module named pip\" >&2\n\
+             exit 1\n",
+            log = log.display(),
+            marker = marker.display(),
+            ensurepip = ensurepip,
+        );
+        let path = dir.join("python3");
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn venv_chain_retries_without_pip_then_reports_the_base_interpreter_when_everything_fails() {
+        let scratch = tempfile::tempdir().unwrap();
+        let log = scratch.path().join("calls.log");
+        let base = fake_base_interpreter(scratch.path(), &log, false);
+        let runtime_dir = scratch.path().join(RUNTIME_DIR);
+
+        let error = provision_venv(&base, &runtime_dir, MISSING_GET_PIP_URL).unwrap_err();
+
+        let calls = fs::read_to_string(&log).unwrap();
+        let runtime = runtime_dir.display().to_string();
+        assert!(calls.contains(&format!("-m venv {runtime}\n")), "{calls}");
+        assert!(
+            calls.contains(&format!("-m venv --without-pip {runtime}\n")),
+            "{calls}"
+        );
+        assert!(error.contains(&base.display().to_string()), "{error}");
+        assert!(error.contains(&runtime), "{error}");
+        assert!(error.contains("ensurepip: Access is denied"), "{error}");
+        assert!(!runtime_dir.exists(), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn venv_chain_keeps_the_single_venv_call_when_pip_already_imports() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let log = scratch.path().join("calls.log");
+        let script = format!(
+            "#!/bin/sh\n\
+             echo \"$*\" >> '{log}'\n\
+             if [ \"$1\" = \"-c\" ]; then exit 0; fi\n\
+             if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"venv\" ]; then\n\
+               mkdir -p \"$3/bin\" && ln -sf \"$0\" \"$3/bin/python\" && exit 0\n\
+             fi\n\
+             exit 1\n",
+            log = log.display(),
+        );
+        let base = scratch.path().join("python3");
+        fs::write(&base, script).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime_dir = scratch.path().join(RUNTIME_DIR);
+
+        provision_venv(&base, &runtime_dir, MISSING_GET_PIP_URL).unwrap();
+
+        let calls = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            calls,
+            format!("-m venv {}\n-c import pip\n", runtime_dir.display()),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn venv_chain_succeeds_through_ensurepip_after_the_without_pip_retry() {
+        let scratch = tempfile::tempdir().unwrap();
+        let log = scratch.path().join("calls.log");
+        let base = fake_base_interpreter(scratch.path(), &log, true);
+        let runtime_dir = scratch.path().join(RUNTIME_DIR);
+
+        provision_venv(&base, &runtime_dir, MISSING_GET_PIP_URL).unwrap();
+
+        let calls = fs::read_to_string(&log).unwrap();
+        let runtime = runtime_dir.display().to_string();
+        assert!(
+            calls.contains(&format!("-m venv --without-pip {runtime}\n")),
+            "{calls}"
+        );
+        assert!(
+            calls.contains("-m ensurepip --upgrade --default-pip\n"),
+            "{calls}"
+        );
+        assert!(!calls.contains("pip install"), "{calls}");
+        assert!(runtime_dir.join(python_relative()).is_file());
     }
 }
