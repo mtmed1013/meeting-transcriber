@@ -54,8 +54,8 @@ impl Default for ModelConfig {
             top_k: None,
             repetition_penalty: None,
             presence_penalty: None,
-            context_limit_tokens: 16384,
-            max_output_tokens: 2560,
+            context_limit_tokens: 32768,
+            max_output_tokens: 4096,
             thinking: false,
             supports_thinking_toggle: false,
         }
@@ -452,7 +452,7 @@ mod tests {
         assert!(remote.get("chat_template_kwargs").is_none(), "{remote}");
         assert_eq!(remote["model"], "m");
         assert_eq!(remote["stream"], false);
-        assert_eq!(remote["max_tokens"], 2560);
+        assert_eq!(remote["max_tokens"], 4096);
         assert_eq!(remote["messages"][0], json!({ "role": "user", "content": "hola" }));
     }
 
@@ -671,7 +671,7 @@ mod tests {
         let remote = tools_request_body(&config, &messages, &tools, choice, false);
         assert!(remote.get("chat_template_kwargs").is_none(), "{remote}");
         assert_eq!(remote["stream"], false);
-        assert_eq!(remote["max_tokens"], 2560);
+        assert_eq!(remote["max_tokens"], 4096);
     }
 
     #[tokio::test]

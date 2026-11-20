@@ -28,10 +28,14 @@ pub const READ_CONTEXT_TOOL_NAME: &str = "read_meeting_context";
 pub const READ_TRANSCRIPT_TOOL_NAME: &str = "read_transcript";
 
 const MAX_ROUNDS: usize = 12;
+const MAX_ROUND_CAP: usize = 40;
+/// Maximum tokens per transcript chunk (~7.5 KB), keeping every chunk well below
+/// `MAX_TOOL_RESULT_CHARS` so `read_transcript` never truncates a chunk silently.
+const MAX_CHUNK_TOKENS: usize = 2_500;
 /// Longest tool result handed back to the model.
-const MAX_TOOL_RESULT_CHARS: usize = 6_000;
+const MAX_TOOL_RESULT_CHARS: usize = 12_000;
 /// Longest single report section accepted from the model.
-const MAX_FIELD_CHARS: usize = 4_000;
+const MAX_FIELD_CHARS: usize = 12_000;
 const ROUNDING_SLACK_TOKENS: usize = 8;
 const NO_REPORT_MESSAGE: &str =
     "el modelo no llamó a save_meeting_report (revisa que soporte tool calling)";
@@ -42,20 +46,21 @@ pub fn analysis_system_prompt(output_language: &str) -> String {
     format!(
         "You are meeting-report-analyst. You read a meeting transcript and deliver the report by \
 calling tools.\n\
-Order: call read_meeting_context first; then read_transcript for chunk 0, 1, … until the text is \
-covered; then call save_meeting_report once.\n\
+Order: call read_meeting_context first; then call read_transcript for EVERY chunk 0, 1, … up to \
+the last chunk; only after reading all chunks, call save_meeting_report once.\n\
 Tools: read_meeting_context() returns the skill and the chunk count; \
 read_transcript(chunk: integer) returns one chunk of the transcript; \
 save_meeting_report(executive_summary, key_decisions, topics_and_discussion, action_items, \
-key_questions, open_issues, important_facts) writes the report, each argument plain Markdown.\n\
+key_questions, open_issues, important_facts) writes the report, each argument rich Markdown.\n\
 Rules: use only what the transcript states; never invent owners, dates, decisions or numbers; \
-write Not specified when data is missing; OUTPUT_LANGUAGE = {output_language} applies to the \
-report content only, never to these instructions.\n\
+write Not specified (in OUTPUT_LANGUAGE) when data is missing; write informative narrative and \
+detailed workflow/process explanations rather than shallow one-line bullets; \
+OUTPUT_LANGUAGE = {output_language} applies to the report content only, never to these instructions.\n\
 Never say you will do something without calling the tool.\n\
 Use your native tool-call format when the server supports it; otherwise reply ONLY with this \
 block, then wait for the result:\n\
 ```tool_call\n\
-{{\"name\": \"save_meeting_report\", \"arguments\": {{\"executive_summary\": \"- …\"}}}}\n\
+{{\"name\": \"save_meeting_report\", \"arguments\": {{\"executive_summary\": \"...\"}}}}\n\
 ```"
     )
 }
@@ -91,17 +96,17 @@ pub fn meeting_tools() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": SAVE_REPORT_TOOL_NAME,
-                "description": "Saves the final meeting report. Every argument is Markdown text.",
+                "description": "Saves the final meeting report. Every argument is rich Markdown text.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "executive_summary": section("3-7 bullets summarising the meeting."),
-                        "key_decisions": section("Explicit decisions and agreements, one bullet each."),
-                        "topics_and_discussion": section("3-8 topic chapters with their points."),
-                        "action_items": section("Checklist bullets: owner, task and due date."),
-                        "key_questions": section("Questions and their answers, or their status."),
-                        "open_issues": section("Unresolved issues with impact and next step."),
-                        "important_facts": section("Dates, numbers, limits, systems and requirements.")
+                        "executive_summary": section("1-2 clear narrative paragraphs covering purpose, participants, main topics/workflows, decisions, and next steps."),
+                        "key_decisions": section("Explicit decisions and agreements with their reason/context when discussed."),
+                        "topics_and_discussion": section("Chronological topic chapters (### Title — HH:MM:SS) with substantive explanations, including step-by-step workflows/processes discussed."),
+                        "action_items": section("Detailed checklist items (- [ ] ...) with owner, specific task, priority/status if stated, due date, and timestamp if available."),
+                        "key_questions": section("Material questions with their answer (or Open/Partially resolved status) and why they matter."),
+                        "open_issues": section("Unresolved problems, bugs, blockers, or risks with impact and next step when stated."),
+                        "important_facts": section("Exact dates, deadlines, rules, laws, endpoints, environments, limits, numbers, and technical constraints.")
                     },
                     "required": [
                         "executive_summary",
@@ -262,20 +267,28 @@ pub async fn analyze_transcript(
     };
     let system = analysis_system_prompt(output_language);
     let tools = meeting_tools();
+    let tool_choice = json!("auto");
     let tools_text: String = tools.iter().map(Value::to_string).collect();
-    let first_user = "Meeting transcript: call read_meeting_context first, then read_transcript, \
-then save_meeting_report."
+    let tool_choice_text = tool_choice.to_string();
+    let first_user = "Meeting transcript: call read_meeting_context first, then read_transcript \
+for every chunk 0..last, then save_meeting_report."
         .to_string();
 
     let input_budget = provider.config().input_budget_tokens();
-    let fixed = estimate_messages_tokens([system.as_str(), first_user.as_str(), tools_text.as_str()])
-        + ROUNDING_SLACK_TOKENS;
-    let chunk_budget = input_budget.saturating_sub(fixed).max(256);
+    let tools_overhead =
+        estimate_messages_tokens([tools_text.as_str(), tool_choice_text.as_str()])
+            + ROUNDING_SLACK_TOKENS;
+    let fixed = estimate_messages_tokens([system.as_str(), first_user.as_str()]) + tools_overhead;
+    let chunk_budget = input_budget
+        .saturating_sub(fixed)
+        .clamp(256, MAX_CHUNK_TOKENS);
     let context = ReportContext {
         skill,
         output_language: output_language.to_string(),
         chunks: chunk_transcript(&working, chunk_budget),
     };
+    let history_budget = input_budget.saturating_sub(tools_overhead);
+    let max_rounds = (context.chunks.len() + 8).clamp(MAX_ROUNDS, MAX_ROUND_CAP);
 
     let mut history = vec![
         json!({ "role": "system", "content": system }),
@@ -287,10 +300,10 @@ then save_meeting_report."
     let mut gathered: Option<MarkdownSections> = None;
     let mut last_error: Option<String> = None;
 
-    for _round in 0..MAX_ROUNDS {
-        trim_history(&mut history, input_budget);
+    for _round in 0..max_rounds {
+        trim_history(&mut history, history_budget);
         let reply = provider
-            .chat_with_tools(&history, &tools, json!("auto"))
+            .chat_with_tools(&history, &tools, tool_choice.clone())
             .await?;
 
         let native = reply.tool_calls();
@@ -373,7 +386,7 @@ then save_meeting_report."
             .iter()
             .map(|call| {
                 let text = context.call(&call.name, &call.arguments);
-                format!("- {} -> \"{}\"", call.name, clip(&text, 2_000))
+                format!("- {} -> \"{}\"", call.name, clip(&text, MAX_TOOL_RESULT_CHARS))
             })
             .collect();
         history.push(json!({
@@ -403,8 +416,8 @@ mod tests {
         OpenAiCompatibleProvider::new(ModelConfig {
             endpoint: format!("{}/v1", server.uri()),
             model: "m".to_string(),
-            context_limit_tokens: 16384,
-            max_output_tokens: 2560,
+            context_limit_tokens: 32768,
+            max_output_tokens: 4096,
             ..ModelConfig::default()
         })
         .expect("provider")
@@ -652,5 +665,137 @@ mod tests {
                     .unwrap()
             });
         assert!(sections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn long_transcript_chunks_are_never_truncated_and_all_chunks_can_be_read() {
+        // ~24,000 chars: previously packed into 1 chunk and silently clipped at 6,000 chars.
+        let long_meeting = (0..300)
+            .map(|i| format!("[15:{:02}:00] Turno {i}: explicacion detallada del flujo de base completa y predictivo.", i % 60))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(long_meeting.len() > 20_000);
+
+        let server = MockServer::start().await;
+        let seen_requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let seen_clone = Arc::clone(&seen_requests);
+
+        // Dynamic responder: reads context, then reads every chunk 0..N, then saves.
+        struct MultiChunkResponder {
+            seen: Arc<std::sync::Mutex<Vec<Value>>>,
+        }
+        impl Respond for MultiChunkResponder {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let mut guard = self.seen.lock().unwrap();
+                let step = guard.len();
+                guard.push(body.clone());
+                drop(guard);
+
+                if step == 0 {
+                    return ResponseTemplate::new(200)
+                        .set_body_json(tool_reply(READ_CONTEXT_TOOL_NAME, json!({})));
+                }
+                let messages = body["messages"].as_array().unwrap();
+                let last_tool = messages
+                    .iter()
+                    .rev()
+                    .find(|m| m["role"] == "tool")
+                    .and_then(|m| m["content"].as_str())
+                    .unwrap_or("");
+                assert!(
+                    !last_tool.contains("[truncated]"),
+                    "tool result was truncated at step {step}: {last_tool}"
+                );
+
+                if step == 1 {
+                    // Parse "Chunks: N" from read_meeting_context output.
+                    let chunks_line = last_tool
+                        .lines()
+                        .find(|l| l.starts_with("Chunks: "))
+                        .expect("Chunks line");
+                    let count: usize = chunks_line.trim_start_matches("Chunks: ").parse().unwrap();
+                    assert!(count >= 2, "expected multiple chunks for 24KB transcript, got {count}");
+                    return ResponseTemplate::new(200)
+                        .set_body_json(tool_reply(READ_TRANSCRIPT_TOOL_NAME, json!({ "chunk": 0 })));
+                }
+
+                // Check which chunk was just returned: "chunk X of Y:"
+                let header = last_tool.lines().next().unwrap_or("");
+                if let Some(rest) = header.strip_prefix("chunk ") {
+                    let parts: Vec<&str> = rest.trim_end_matches(':').split(" of ").collect();
+                    let idx: usize = parts[0].parse().unwrap();
+                    let last: usize = parts[1].parse().unwrap();
+                    if idx < last {
+                        return ResponseTemplate::new(200).set_body_json(tool_reply(
+                            READ_TRANSCRIPT_TOOL_NAME,
+                            json!({ "chunk": idx + 1 }),
+                        ));
+                    }
+                }
+
+                let long_topics = "### Flujo de base completa\n\n".to_string() + &"Detalle del flujo. ".repeat(300);
+                ResponseTemplate::new(200).set_body_json(tool_reply(
+                    SAVE_REPORT_TOOL_NAME,
+                    json!({
+                        "executive_summary": "Resumen narrativo completo.",
+                        "topics_and_discussion": long_topics
+                    }),
+                ))
+            }
+        }
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(MultiChunkResponder { seen: seen_clone })
+            .mount(&server)
+            .await;
+
+        let sections = analyze_transcript(&provider(&server), &long_meeting, "Spanish", "")
+            .await
+            .unwrap();
+
+        assert_eq!(sections.executive_summary, "Resumen narrativo completo.");
+        assert!(
+            sections.topics_and_discussion.len() > 4_500,
+            "topics_and_discussion should not be clipped at 4000 chars, got {}",
+            sections.topics_and_discussion.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_text_tool_fallback_does_not_truncate_skill_or_chunk() {
+        let long_skill = "SKILL_START ".to_string() + &"regla ".repeat(450) + "SKILL_END";
+        assert!(long_skill.len() > 2_500);
+
+        let server = MockServer::start().await;
+        let seen = serve(
+            &server,
+            vec![
+                reply("```tool_call\n{\"name\": \"read_meeting_context\", \"arguments\": {}}\n```", "stop"),
+                reply(&save_call("Resumen completo."), "stop"),
+            ],
+        )
+        .await;
+
+        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", &long_skill)
+            .await
+            .unwrap();
+        assert_eq!(sections.executive_summary, "Resumen completo.");
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+
+        let requests = server.received_requests().await.unwrap();
+        let second_body: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let last_user = second_body["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            last_user.contains("SKILL_END"),
+            "plain-text fallback truncated the skill prompt: {last_user}"
+        );
     }
 }

@@ -17,5 +17,6 @@ pub use error::CoreError;
 pub use report::{
     ActionItem, DecisionItem, IssueItem, MarkdownSections, QuestionItem, ReportSections, TopicItem,
     assemble_markdown_report, assemble_report_markdown, default_report_skill_prompt,
-    short_meeting_markdown, strip_existing_report, write_atomic_in_place,
+    is_legacy_default_report_skill_prompt, short_meeting_markdown, strip_existing_report,
+    write_atomic_in_place,
 };

@@ -17,10 +17,7 @@ const SEPARATOR: &str = "---";
 /// accepts the Spanish variant written by older builds.
 const TRANSCRIPT_HEADING: &str = ENGLISH_TRANSCRIPT_HEADING;
 
-/// Default instructions for the `meeting-report-analyst` skill. The user can override them in
-/// settings; a blank override falls back to this text.
-pub fn default_report_skill_prompt() -> String {
-    r#"You are meeting-report-analyst. Turn a meeting transcript into an accurate, structured report so that someone who did not attend understands its purpose, topics, decisions, action items, questions, blockers, and key facts.
+const LEGACY_DEFAULT_REPORT_SKILL_PROMPT_V1: &str = r#"You are meeting-report-analyst. Turn a meeting transcript into an accurate, structured report so that someone who did not attend understands its purpose, topics, decisions, action items, questions, blockers, and key facts.
 
 LANGUAGE: OUTPUT_LANGUAGE is authoritative for all generated text. Do not detect or switch language from the transcript. Keep technical terms, code, API names, URLs, product names, and proper nouns unchanged.
 
@@ -42,7 +39,43 @@ SECTIONS (call save_meeting_report):
 - open_issues: unresolved problems, blockers, or risks explicitly discussed. Add impact and next_step only if stated.
 - important_facts: exact dates, deadlines, limits, quantities, prices, percentages, URLs, systems, versions, constraints, dependencies.
 
-DELIVERY: Deliver all sections only through save_meeting_report. Use empty arrays when nothing applies. Never reply with prose or Markdown."#
+DELIVERY: Deliver all sections only through save_meeting_report. Use empty arrays when nothing applies. Never reply with prose or Markdown."#;
+
+/// Returns `true` when `prompt` matches an unmodified previous built-in default skill prompt,
+/// allowing saved settings to upgrade automatically without overwriting user customizations.
+pub fn is_legacy_default_report_skill_prompt(prompt: &str) -> bool {
+    prompt.trim() == LEGACY_DEFAULT_REPORT_SKILL_PROMPT_V1.trim()
+}
+
+/// Default instructions for the `meeting-report-analyst` skill. The user can override them in
+/// settings; a blank override falls back to this text.
+pub fn default_report_skill_prompt() -> String {
+    r#"You are meeting-report-analyst. Turn a meeting transcript into a thorough, accurate, structured Markdown report so someone who did not attend understands the purpose, workflows, topics, decisions, action items, questions, blockers, and key facts.
+
+LANGUAGE: OUTPUT_LANGUAGE is authoritative for all generated text. Do not detect or switch language from the transcript. Keep technical terms, code, API names, URLs, product names, and proper nouns unchanged.
+
+ACCURACY:
+- Read ALL transcript chunks from start to finish before writing. Later turns often clarify, answer, or override earlier ones.
+- Use only what the transcript states. Never invent decisions, tasks, owners, deadlines, names, dates, numbers, requirements, risks, or answers.
+- Never invent sentiment, engagement, or quality metrics.
+- Write 'Not specified' (translated to OUTPUT_LANGUAGE) for a missing owner or due date. Never guess an owner. Keep vague deadlines verbatim, such as 'tomorrow'.
+- Keep speaker labels as written. When statements change, prefer the final agreed position.
+- Fix obvious speech-to-text errors from context. Never guess uncertain meaning.
+
+STYLE & DEPTH (avoid shallow one-line bullets):
+- Write informative, concrete prose and structured details, not vague one-line dots.
+- Explicitly document every workflow or process ('flujo') discussed: explain how it works end-to-end (trigger/entry, steps, rules, conditions, exceptions, systems involved, and differences between flows).
+
+SECTIONS (call save_meeting_report with Markdown strings):
+- executive_summary: 1 to 2 clear narrative paragraphs (not bare bullets) covering date/time if stated, objective, participants, main topics and workflows discussed, key decisions, and next steps. Skip small talk.
+- key_decisions: explicit decisions, commitments, or approvals only (a suggestion like 'maybe' or 'we could' is not a decision), with reason/context when discussed.
+- topics_and_discussion: chronological chapters (`### Title — HH:MM:SS` when timestamp exists, else `### Title`). Merge related turns and explain the substance, reasoning, technical details, and step-by-step workflows/processes discussed.
+- action_items: Markdown checklist (`- [ ] ...`) for executable commitments only, with Owner, specific Task, Due date, plus Priority, Status, and Timestamp (`[HH:MM:SS]`) when present in the transcript.
+- key_questions: material questions about requirements, architecture, rules, workflows, risks, deadlines, or ownership. Give the answer if resolved later, or status 'Open'/'Partially resolved' in OUTPUT_LANGUAGE, plus why it matters.
+- open_issues: unresolved problems, bugs, blockers, or risks explicitly discussed, with impact and next step when stated.
+- important_facts: exact dates, deadlines, limits, quantities, prices, percentages, URLs, endpoints, environments, laws/rules, systems, versions, constraints, and dependencies.
+
+DELIVERY: Deliver all sections only through save_meeting_report. Use an empty string "" when nothing applies to a section. Never reply with prose outside the tool call."#
         .to_string()
 }
 
@@ -866,19 +899,22 @@ Texto original.
         for expected in [
             "save_meeting_report",
             "OUTPUT_LANGUAGE",
-            "null",
+            "Not specified",
             "Never invent",
             "suggestion",
             "final agreed position",
+            "narrative",
+            "workflow",
         ] {
             assert!(prompt.contains(expected), "missing {expected:?} in:\n{prompt}");
         }
+        assert!(!prompt.contains("else null"), "stale JSON wording in:\n{prompt}");
     }
 
     #[test]
     fn default_report_skill_prompt_is_compact_and_covers_the_contract() {
         let prompt = default_report_skill_prompt();
-        assert!(prompt.len() <= 2400, "{} bytes:\n{prompt}", prompt.len());
+        assert!(prompt.len() <= 3200, "{} bytes:\n{prompt}", prompt.len());
         for section in [
             "executive_summary",
             "key_decisions",
@@ -898,7 +934,9 @@ Texto original.
             "save_meeting_report",
             "suggestion",
             "Never invent",
-            "null",
+            "Not specified",
+            "workflow",
+            "narrative",
         ] {
             assert!(prompt.contains(expected), "missing {expected:?} in:\n{prompt}");
         }

@@ -1209,13 +1209,13 @@ mod tests {
             use_hf_recommended_config: false,
             ..hf_settings()
         };
-        assert_eq!(effective_context_tokens(&manual, &suggested), 16384, "manual mode ignores the profile");
+        assert_eq!(effective_context_tokens(&manual, &suggested), 32768, "manual mode ignores the profile");
 
         let unknown = SuggestedModelConfig {
             max_context_tokens: None,
             ..hf_suggestion()
         };
-        assert_eq!(effective_context_tokens(&hf_settings(), &unknown), 16384);
+        assert_eq!(effective_context_tokens(&hf_settings(), &unknown), 32768);
     }
 
     #[test]
@@ -1233,7 +1233,7 @@ mod tests {
         assert_eq!(config.repetition_penalty, Some(1.05));
         assert_eq!(config.presence_penalty, Some(1.5));
         assert_eq!(config.context_limit_tokens, 8192);
-        assert_eq!(config.max_output_tokens, 2560, "a reply reservation that fits is kept");
+        assert_eq!(config.max_output_tokens, 4096, "a reply reservation that fits is kept");
         assert!(!config.thinking, "ai_disable_thinking turns thinking off");
     }
 
@@ -1269,7 +1269,7 @@ mod tests {
         assert_eq!(config.top_k, Some(40));
         assert_eq!(config.repetition_penalty, Some(1.1));
         assert_eq!(config.presence_penalty, None, "there is no manual presence penalty");
-        assert_eq!(config.context_limit_tokens, 16384, "the profile does not clamp the context");
+        assert_eq!(config.context_limit_tokens, 32768, "the profile does not clamp the context");
         assert!(!config.thinking);
 
         let unset = AppSettings {

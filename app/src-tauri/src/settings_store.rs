@@ -9,7 +9,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use mt_core::config::{
     AiSource, AppSettings, CorrectionRule, SttEngine, ThemeMode, WhisperSize, import_dotenv,
 };
-use mt_core::report::{default_report_skill_prompt, write_atomic_in_place};
+use mt_core::report::{
+    default_report_skill_prompt, is_legacy_default_report_skill_prompt, write_atomic_in_place,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -520,10 +522,12 @@ fn find_legacy_dotenv(app: &AppHandle) -> Option<PathBuf> {
 }
 
 fn parse_settings(text: &str) -> AppSettings {
-    serde_json::from_str(text).unwrap_or_else(|err| {
+    let mut settings: AppSettings = serde_json::from_str(text).unwrap_or_else(|err| {
         eprintln!("settings: invalid settings.json, using defaults: {err}");
         AppSettings::default()
-    })
+    });
+    settings.report_skill_prompt = non_blank_report_skill_prompt(&settings.report_skill_prompt);
+    settings
 }
 
 fn non_negative(name: &str, value: f64) -> Result<f64, String> {
@@ -568,9 +572,10 @@ fn repetition_penalty(value: f32) -> Result<f32, String> {
     }
 }
 
-/// The saved report prompt, or the default one when the saved value is blank.
+/// The saved report prompt, or the default one when the saved value is blank or matches an
+/// unmodified previous built-in default.
 fn non_blank_report_skill_prompt(saved: &str) -> String {
-    if saved.trim().is_empty() {
+    if saved.trim().is_empty() || is_legacy_default_report_skill_prompt(saved) {
         default_report_skill_prompt()
     } else {
         saved.to_string()
@@ -793,5 +798,15 @@ mod tests {
         assert_eq!(replaced.ai_temperature, Some(1.0));
         assert_eq!(replaced.ai_top_k, Some(50));
         assert_eq!(replaced.ai_top_p, None);
+    }
+
+    #[test]
+    fn parse_settings_upgrades_unmodified_legacy_default_skill_prompt_and_keeps_custom() {
+        let legacy = "You are meeting-report-analyst. Turn a meeting transcript into an accurate, structured report so that someone who did not attend understands its purpose, topics, decisions, action items, questions, blockers, and key facts.\n\nLANGUAGE: OUTPUT_LANGUAGE is authoritative for all generated text. Do not detect or switch language from the transcript. Keep technical terms, code, API names, URLs, product names, and proper nouns unchanged.\n\nACCURACY:\n- Read the whole transcript first. Use only what it states.\n- Never invent decisions, tasks, owners, deadlines, names, dates, numbers, requirements, risks, or answers.\n- Never invent sentiment, engagement, or quality metrics.\n- Use null for a missing owner or due date. Never guess an owner. Keep vague deadlines verbatim, such as 'tomorrow'.\n- Keep speaker labels as written.\n- When statements change, prefer the final agreed position.\n- Fix obvious speech-to-text errors from context. Never guess uncertain meaning.\n\nSECTIONS (call save_meeting_report):\n- executive_summary: 3 to 7 bullets, 150 words at most: purpose, main discussion, outcome, decisions, next steps, major blockers. Skip small talk.\n- key_decisions: explicit decisions, commitments, or approvals only. A suggestion ('maybe', 'we could') is not a decision. Add reason only if explicitly discussed.\n- topics_and_discussion: 3 to 8 chronological chapters, merging related turns. timestamp only if stated, else null. points: substantive summaries.\n- action_items: executable commitments only, with owner or null, task, and due or null.\n- key_questions: material questions about requirements, architecture, rules, risks, deadlines, or ownership. Give answer, or status 'Open' or 'Partially resolved' in OUTPUT_LANGUAGE.\n- open_issues: unresolved problems, blockers, or risks explicitly discussed. Add impact and next_step only if stated.\n- important_facts: exact dates, deadlines, limits, quantities, prices, percentages, URLs, systems, versions, constraints, dependencies.\n\nDELIVERY: Deliver all sections only through save_meeting_report. Use empty arrays when nothing applies. Never reply with prose or Markdown.";
+        let upgraded = parse_settings(&json!({ "report_skill_prompt": legacy }).to_string());
+        assert_eq!(upgraded.report_skill_prompt, default_report_skill_prompt());
+
+        let custom = parse_settings(&json!({ "report_skill_prompt": "My custom skill" }).to_string());
+        assert_eq!(custom.report_skill_prompt, "My custom skill");
     }
 }
