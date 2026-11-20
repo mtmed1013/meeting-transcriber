@@ -1251,6 +1251,7 @@ mod tests {
 
     // --- uv bootstrap -------------------------------------------------
 
+    #[cfg(unix)]
     fn sha256_hex(bytes: &[u8]) -> String {
         Sha256::digest(bytes)
             .iter()

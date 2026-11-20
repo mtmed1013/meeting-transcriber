@@ -191,6 +191,7 @@ fn collect_unix_candidates(
 }
 
 /// Adds the interpreters in each `<root>/<version>/bin` directory, e.g. pyenv and uv layouts.
+#[cfg(not(windows))]
 fn add_versioned_installations(candidates: &mut Vec<Candidate>, root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
