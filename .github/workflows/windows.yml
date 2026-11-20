@@ -3,6 +3,9 @@ name: Windows installers
 # Builds the Windows MSI and NSIS installers on a real Windows runner.
 # Cross-compiling Tauri bundles from macOS is not supported, so this is the supported path:
 #   git push  ->  Actions  ->  "Windows installers"  ->  download the artifacts.
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
   push:
@@ -47,6 +50,17 @@ jobs:
         run: |
           Get-ChildItem -Recurse -Path target/x86_64-pc-windows-msvc/release/bundle -Include *.msi,*.exe |
             Select-Object FullName, Length | Format-Table -AutoSize
+
+
+      - name: Publish the installers on a release
+        # Artifact downloads hit the Actions egress quota; a release asset does not.
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Meeting Transcriber ${{ github.ref_name }}
+          files: |
+            target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
 
       - name: Upload installers
         uses: actions/upload-artifact@v4
