@@ -13,7 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mt_core::{AppSettings, SttEngine, WhisperSize};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -26,6 +26,14 @@ pub const WHISTLE_FILE: &str = "whistle.cact";
 
 const PROGRESS_EVENT: &str = "stt-provision-progress";
 const DEV_MARKER: &str = "meeting_transcriber.py";
+/// Device listing script, run with `--list-devices` to print one JSON line.
+const WINDOWS_AUDIO_SCRIPT: &str = "windows_audio.py";
+/// Shown for the device list off Windows, where WASAPI devices do not exist.
+const NOT_WINDOWS_DETAIL: &str = "Solo disponible en Windows.";
+/// Shown when the device list cannot run because the transcription engine is not installed.
+const ENGINE_MISSING_DETAIL: &str = "Instala primero el motor de transcripción para listar los dispositivos de audio.";
+/// Shown when the device script prints nothing usable and writes nothing to stderr.
+const DEVICE_OUTPUT_INVALID_DETAIL: &str = "windows_audio.py no devolvió una lista de dispositivos válida.";
 /// Shown when the app-managed venv is older than 3.10 or has the wrong architecture.
 const INCOMPATIBLE_RUNTIME_DETAIL: &str = "El entorno Python actual es incompatible (< 3.10 o arquitectura incorrecta); se recreará al instalar.";
 /// Longest streamed installer line sent to the UI, in characters.
@@ -121,6 +129,26 @@ pub struct SttModelStatus {
     pub detail: String,
     pub python_ready: bool,
     pub models_dir: String,
+}
+
+/// Audio devices reported by `windows_audio.py`. `detail` explains why a list is empty, when it is.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsAudioDevices {
+    pub microphones: Vec<String>,
+    pub speakers: Vec<String>,
+    pub detail: Option<String>,
+}
+
+/// The `--list-devices` line printed by `windows_audio.py`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceReport {
+    #[serde(default)]
+    microphones: Vec<String>,
+    #[serde(default)]
+    speakers: Vec<String>,
+    error: Option<String>,
 }
 
 /// Payload of the `stt-provision-progress` event.
@@ -242,6 +270,90 @@ pub async fn stt_model_status(
 ) -> Result<SttModelStatus, String> {
     let paths = resolve_python_and_paths(&app)?;
     blocking(move || Ok(probe_status(&paths, &settings))).await
+}
+
+/// Lists the WASAPI microphones and speakers through `windows_audio.py --list-devices`. Never fails:
+/// a missing engine, a failed run, or unreadable output gives empty lists with an explanation.
+#[tauri::command]
+pub async fn list_windows_audio_devices(app: AppHandle) -> Result<WindowsAudioDevices, String> {
+    if !cfg!(windows) {
+        return Ok(non_windows_devices());
+    }
+    let paths = match resolve_python_and_paths(&app) {
+        Ok(paths) => paths,
+        Err(detail) => return Ok(unavailable_devices(detail)),
+    };
+    blocking(move || Ok(query_windows_audio_devices(&paths))).await
+}
+
+/// The device list off Windows: empty, with the reason.
+fn non_windows_devices() -> WindowsAudioDevices {
+    unavailable_devices(NOT_WINDOWS_DETAIL.to_string())
+}
+
+fn unavailable_devices(detail: String) -> WindowsAudioDevices {
+    WindowsAudioDevices {
+        microphones: Vec::new(),
+        speakers: Vec::new(),
+        detail: Some(detail),
+    }
+}
+
+/// Runs the device script with the engine interpreter and parses its JSON line. A non-zero exit or
+/// unreadable output gives empty lists with the stderr tail as the detail.
+fn query_windows_audio_devices(paths: &SttPaths) -> WindowsAudioDevices {
+    let script = paths.script_dir.join(WINDOWS_AUDIO_SCRIPT);
+    if !script.is_file() || !paths.python_exe.is_file() {
+        return unavailable_devices(ENGINE_MISSING_DETAIL.to_string());
+    }
+    let mut command = hidden_command(&paths.python_exe);
+    command.arg(&script).arg("--list-devices").stdin(Stdio::null());
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(error) => {
+            return unavailable_devices(format!("No se pudo listar los dispositivos: {error}"));
+        }
+    };
+    if !output.status.success() {
+        return unavailable_devices(stderr_detail(&output.stderr, DEVICE_OUTPUT_INVALID_DETAIL));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_devices_json(&stdout)
+        .unwrap_or_else(|| unavailable_devices(stderr_detail(&output.stderr, DEVICE_OUTPUT_INVALID_DETAIL)))
+}
+
+/// Parses the last non-empty line of `stdout` as the device report. Earlier lines are ignored, so
+/// stray output before the JSON line does not break the list. `None` when that line is not valid JSON.
+fn parse_devices_json(stdout: &str) -> Option<WindowsAudioDevices> {
+    let line = stdout.lines().map(str::trim).rfind(|line| !line.is_empty())?;
+    let report: DeviceReport = serde_json::from_str(line).ok()?;
+    Some(WindowsAudioDevices {
+        microphones: clean_names(report.microphones),
+        speakers: clean_names(report.speakers),
+        detail: report
+            .error
+            .map(|error| error.trim().to_string())
+            .filter(|error| !error.is_empty()),
+    })
+}
+
+/// Trims each device name and drops the empty ones.
+fn clean_names(names: Vec<String>) -> Vec<String> {
+    names
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// The stderr tail when there is one, otherwise `fallback`.
+fn stderr_detail(stderr: &[u8], fallback: &str) -> String {
+    let tail = stderr_tail(stderr);
+    if tail.is_empty() {
+        fallback.to_string()
+    } else {
+        tail
+    }
 }
 
 /// Creates the isolated venv when no interpreter exists, installs `requirements.txt`, and then
@@ -1016,6 +1128,68 @@ pub(crate) fn io_error(error: io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_devices_json_reads_both_lists_and_no_detail() {
+        let devices = parse_devices_json(
+            r#"{"microphones": ["Mic A", "Mic B"], "speakers": ["Speakers"]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(devices.microphones, vec!["Mic A", "Mic B"]);
+        assert_eq!(devices.speakers, vec!["Speakers"]);
+        assert_eq!(devices.detail, None);
+    }
+
+    #[test]
+    fn parse_devices_json_keeps_the_error_as_detail() {
+        let devices = parse_devices_json(
+            r#"{"microphones": [], "speakers": [], "error": "soundcard missing"}"#,
+        )
+        .unwrap();
+
+        assert!(devices.microphones.is_empty());
+        assert!(devices.speakers.is_empty());
+        assert_eq!(devices.detail.as_deref(), Some("soundcard missing"));
+    }
+
+    #[test]
+    fn parse_devices_json_trims_names_and_drops_empty_ones() {
+        let devices = parse_devices_json(
+            r#"{"microphones": ["  Mic  ", "", "   "], "speakers": [" "], "error": "  "}"#,
+        )
+        .unwrap();
+
+        assert_eq!(devices.microphones, vec!["Mic"]);
+        assert!(devices.speakers.is_empty());
+        assert_eq!(devices.detail, None, "a blank error is no error");
+    }
+
+    #[test]
+    fn parse_devices_json_uses_only_the_last_non_empty_line() {
+        let stdout = "SoundCard warning: something\n{\"microphones\": [\"Mic\"], \"speakers\": []}\n\n  \n";
+
+        let devices = parse_devices_json(stdout).unwrap();
+
+        assert_eq!(devices.microphones, vec!["Mic"]);
+    }
+
+    #[test]
+    fn parse_devices_json_rejects_invalid_or_empty_output() {
+        assert!(parse_devices_json("not json").is_none());
+        assert!(parse_devices_json("{\"microphones\": [\"Mic\"]} trailing noise").is_none());
+        assert!(parse_devices_json("").is_none());
+        assert!(parse_devices_json("  \n \n").is_none());
+    }
+
+    #[test]
+    fn device_listing_off_windows_is_empty_and_says_so() {
+        let devices = non_windows_devices();
+
+        assert!(devices.microphones.is_empty());
+        assert!(devices.speakers.is_empty());
+        assert_eq!(devices.detail.as_deref(), Some("Solo disponible en Windows."));
+    }
 
     #[test]
     fn auto_selects_whistle_only_on_macos_arm64_and_windows_x64() {

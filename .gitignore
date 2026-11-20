@@ -27,3 +27,4 @@ app/src-tauri/gen/
 
 # Instaladores descargados de CI
 installers-windows/
+installers-final/

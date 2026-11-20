@@ -14,6 +14,7 @@ use mt_models::{
     detect_machine, discard_partial, list_gguf_options, load_local_suggested_config,
     parse_reference, save_local_suggested_config,
 };
+use mt_models::assess::ToolSupport;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -59,7 +60,9 @@ pub struct InspectionView {
     pub disk_ok: bool,
     pub disk_free_bytes: u64,
     pub can_install: bool,
-    /// True when the repository declares tool calling.
+    /// Tool calling as declared by the repository: `supported`, `unsupported`, or `unknown`.
+    pub tool_support: ToolSupport,
+    /// False only when the repository is known not to support tool calling (`unknown` counts as allowed).
     pub supports_tools: bool,
     pub verdict: String,
     /// Runtime settings suggested for the model, from the repository files it ships with.
@@ -88,7 +91,8 @@ impl InspectionView {
             disk_ok: assessment.disk_ok,
             disk_free_bytes: assessment.disk_free_bytes,
             can_install: plan.is_some() && assessment.can_install(),
-            supports_tools: assessment.supports_tools,
+            tool_support: assessment.tool_support,
+            supports_tools: assessment.supports_tools(),
             verdict: assessment.verdict.clone(),
             suggested_config: assessment.suggested_config.clone(),
         }
@@ -432,10 +436,11 @@ async fn inspect(
         .fetch_tokenizer_config(&reference)
         .await
         .map_err(|err| err.to_string())?;
-    // The chat template of a GGUF model is usually embedded in the file, so its header is the fallback.
-    let gguf_header = match (&tokenizer_config, planned_gguf_file(&info, &reference, gguf_filename)) {
+    // The chat template of a GGUF model is usually embedded in the file, so it is read from there when the
+    // tokenizer config does not provide one.
+    let gguf_chat_template = match (&tokenizer_config, planned_gguf_file(&info, &reference, gguf_filename)) {
         (None, Some(file)) => hub
-            .fetch_gguf_header_sample(&reference, &file)
+            .fetch_gguf_chat_template(&reference, &file)
             .await
             .map_err(|err| err.to_string())?,
         _ => None,
@@ -449,7 +454,7 @@ async fn inspect(
         config: config.as_ref(),
         generation_config: generation_config.as_ref(),
         tokenizer_config: tokenizer_config.as_ref(),
-        gguf_header: gguf_header.as_deref(),
+        gguf_chat_template: gguf_chat_template.as_deref(),
     };
     Ok(build_inspection(
         &info,
@@ -467,7 +472,7 @@ struct FetchedFiles<'a> {
     config: Option<&'a serde_json::Value>,
     generation_config: Option<&'a serde_json::Value>,
     tokenizer_config: Option<&'a serde_json::Value>,
-    gguf_header: Option<&'a [u8]>,
+    gguf_chat_template: Option<&'a str>,
 }
 
 /// The GGUF file the install would use (first shard for sharded models). `None` for non-GGUF plans.
@@ -498,7 +503,7 @@ fn build_inspection(
         config: fetched.config,
         generation_config: fetched.generation_config,
         tokenizer_config: fetched.tokenizer_config,
-        gguf_header: fetched.gguf_header,
+        gguf_chat_template: fetched.gguf_chat_template,
         machine,
         gguf_filename,
         context_tokens,
@@ -988,6 +993,7 @@ mod tests {
             "diskOk",
             "diskFreeBytes",
             "canInstall",
+            "toolSupport",
             "supportsTools",
             "verdict",
             "suggestedConfig",
@@ -1001,7 +1007,9 @@ mod tests {
         assert_eq!(json["format"], "gguf");
         assert_eq!(json["fit"], "fits");
         assert_eq!(json["canInstall"], false);
-        assert_eq!(json["supportsTools"], false);
+        // No tag and no chat template is unknown tool support, which is allowed.
+        assert_eq!(json["toolSupport"], "unknown");
+        assert_eq!(json["supportsTools"], true);
     }
 
     #[test]
@@ -1039,10 +1047,30 @@ mod tests {
     }
 
     #[test]
-    fn inspection_view_blocks_a_model_that_declares_no_tool_support() {
+    fn inspection_view_blocks_a_model_whose_chat_template_declares_no_tool_support() {
         let info = repo(&[("model-Q4_K_M.gguf", 2 * MIB)]);
         let reference = RepoRef { repo_id: "org/model".into(), revision: "main".into() };
+        let tokenizer = serde_json::json!({ "chat_template": "{{ messages }}" });
+        let fetched = FetchedFiles { tokenizer_config: Some(&tokenizer), ..FetchedFiles::default() };
         let (plan, view) = build_inspection(
+            &info,
+            &reference,
+            &fetched,
+            &machine("macos", "aarch64"),
+            Some("model-Q4_K_M.gguf"),
+            4096,
+        );
+        assert!(plan.is_some(), "the plan is still shown");
+        assert_eq!(view.tool_support, ToolSupport::Unsupported);
+        assert!(!view.supports_tools);
+        assert!(!view.can_install, "{}", view.verdict);
+    }
+
+    #[test]
+    fn inspection_view_keeps_an_install_possible_when_tool_support_is_unknown() {
+        let info = repo(&[("model-Q4_K_M.gguf", 2 * MIB)]);
+        let reference = RepoRef { repo_id: "org/model".into(), revision: "main".into() };
+        let (_, view) = build_inspection(
             &info,
             &reference,
             &FetchedFiles::default(),
@@ -1050,9 +1078,9 @@ mod tests {
             Some("model-Q4_K_M.gguf"),
             4096,
         );
-        assert!(plan.is_some(), "the plan is still shown");
-        assert!(!view.supports_tools);
-        assert!(!view.can_install, "{}", view.verdict);
+        assert_eq!(view.tool_support, ToolSupport::Unknown);
+        assert!(view.supports_tools);
+        assert!(view.can_install, "{}", view.verdict);
     }
 
     #[test]
@@ -1069,23 +1097,17 @@ mod tests {
             Some("model-Q4_K_M.gguf"),
             4096,
         );
+        assert_eq!(view.tool_support, ToolSupport::Supported);
         assert!(view.supports_tools);
         assert!(view.can_install, "{}", view.verdict);
     }
 
     #[test]
-    fn inspection_view_reads_tool_support_from_the_gguf_header_without_tokenizer_config() {
+    fn inspection_view_reads_tool_support_from_the_gguf_chat_template_without_tokenizer_config() {
         let info = repo(&[("model-Q4_K_M.gguf", 2 * MIB)]);
         let reference = RepoRef { repo_id: "org/model".into(), revision: "main".into() };
         let template = "{% if tools %}{{ tools }}{% endif %}";
-        let key = "tokenizer.chat_template";
-        let mut header = b"GGUF\x03\x00\x00\x00".to_vec();
-        header.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        header.extend_from_slice(key.as_bytes());
-        header.extend_from_slice(&8u32.to_le_bytes());
-        header.extend_from_slice(&(template.len() as u64).to_le_bytes());
-        header.extend_from_slice(template.as_bytes());
-        let fetched = FetchedFiles { gguf_header: Some(&header), ..FetchedFiles::default() };
+        let fetched = FetchedFiles { gguf_chat_template: Some(template), ..FetchedFiles::default() };
         let (_, view) = build_inspection(
             &info,
             &reference,
@@ -1094,6 +1116,7 @@ mod tests {
             Some("model-Q4_K_M.gguf"),
             4096,
         );
+        assert_eq!(view.tool_support, ToolSupport::Supported);
         assert!(view.supports_tools);
         assert!(view.can_install, "{}", view.verdict);
     }

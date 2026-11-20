@@ -41,6 +41,7 @@ pub fn run() {
             settings_store::update_settings,
             settings_store::pick_directory,
             settings_store::pick_meeting_file,
+            stt_provisioning::list_windows_audio_devices,
             settings_store::import_legacy_dotenv,
             model_hub::model_hub_state,
             model_hub::model_hub_inspect,

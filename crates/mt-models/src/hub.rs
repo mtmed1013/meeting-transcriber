@@ -20,6 +20,20 @@ const MAX_TOKENIZER_CONFIG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GENERATION_CONFIG_BYTES: usize = 2 * 1024 * 1024;
 /// Leading bytes of a GGUF file requested as its metadata header, in bytes.
 pub(crate) const GGUF_HEADER_SAMPLE_BYTES: usize = 64 * 1024;
+/// Growing leading windows of a GGUF file searched for its embedded chat template, in bytes.
+const GGUF_CHAT_TEMPLATE_WINDOWS: [usize; 5] = [
+    GGUF_HEADER_SAMPLE_BYTES,
+    512 * 1024,
+    4 * 1024 * 1024,
+    16 * 1024 * 1024,
+    24 * 1024 * 1024,
+];
+/// Largest `tokenizer.chat_template` value read from a GGUF file, in bytes.
+const MAX_GGUF_CHAT_TEMPLATE_BYTES: usize = 32 * 1024;
+/// GGUF metadata key holding the embedded chat template.
+const GGUF_CHAT_TEMPLATE_KEY: &[u8] = b"tokenizer.chat_template";
+/// GGUF metadata value type code for strings.
+const GGUF_TYPE_STRING: u32 = 8;
 /// User-agent sent with every hub request.
 const USER_AGENT: &str = "MeetingTranscriber";
 /// Time allowed to establish a connection.
@@ -163,34 +177,62 @@ impl HubClient {
             .await
     }
 
-    /// Fetches the leading [`GGUF_HEADER_SAMPLE_BYTES`] of one GGUF file, where the chat template lives.
-    /// `Ok(None)` when the hub refuses the range (for example 416 on a tiny file) or answers with a
-    /// non-2xx status. At most the sample size is read, even when the hub ignores the range request.
-    pub async fn fetch_gguf_header_sample(
+    /// Reads the chat template embedded in one GGUF file's metadata (`tokenizer.chat_template`).
+    ///
+    /// Requests growing leading windows of the file and stops at the first window that contains the key.
+    /// `Ok(None)` when no readable template is found: refused ranges (404/416), other non-success
+    /// statuses, read errors, a missing or invalid length, or a value cut short by the window. Each window
+    /// replaces the previous buffer, so at most one window is held in memory.
+    pub async fn fetch_gguf_chat_template(
         &self,
         reference: &RepoRef,
         filename: &str,
-    ) -> Result<Option<Vec<u8>>, ModelHubError> {
-        let range = format!("bytes=0-{}", GGUF_HEADER_SAMPLE_BYTES - 1);
+    ) -> Result<Option<String>, ModelHubError> {
+        let url = self.file_url(reference, filename);
+        for window in GGUF_CHAT_TEMPLATE_WINDOWS {
+            let Some(bytes) = self.fetch_leading_bytes(&url, window).await else {
+                return Ok(None);
+            };
+            match scan_gguf_chat_template(&bytes) {
+                TemplateScan::Found(template) => return Ok(Some(template)),
+                TemplateScan::Invalid => return Ok(None),
+                // The file ended inside this window, so a larger window cannot contain more of it.
+                TemplateScan::Absent | TemplateScan::Truncated if bytes.len() < window => {
+                    return Ok(None);
+                }
+                // Key not seen yet, or its value crosses this window's end: try the next, larger window.
+                TemplateScan::Absent | TemplateScan::Truncated => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// Reads at most `window` leading bytes of `url`. `None` when the hub refuses the range, answers with a
+    /// non-2xx status or the transfer fails. Reading stops at `window` even if the hub ignores the range.
+    async fn fetch_leading_bytes(&self, url: &str, window: usize) -> Option<Vec<u8>> {
+        let range = format!("bytes=0-{}", window - 1);
         let mut response = self
             .http
-            .get(self.file_url(reference, filename))
+            .get(url)
             .header(reqwest::header::RANGE, range)
             .send()
-            .await?;
+            .await
+            .ok()?;
         if !response.status().is_success() {
-            return Ok(None);
+            return None;
         }
-        let mut sample = Vec::with_capacity(GGUF_HEADER_SAMPLE_BYTES);
-        while let Some(chunk) = response.chunk().await? {
-            let room = GGUF_HEADER_SAMPLE_BYTES - sample.len();
-            if chunk.len() >= room {
-                sample.extend_from_slice(&chunk[..room]);
-                break;
+        let mut body = Vec::new();
+        while body.len() < window {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let room = window - body.len();
+                    body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                }
+                Ok(None) => break,
+                Err(_) => return None,
             }
-            sample.extend_from_slice(&chunk);
         }
-        Ok(Some(sample))
+        Some(body)
     }
 
     /// Shared reader for small optional JSON files at the repository root.
@@ -223,6 +265,56 @@ impl HubClient {
             .map(Some)
             .map_err(|err| ModelHubError::BadResponse(format!("{name} no es JSON: {err}")))
     }
+}
+
+/// Result of scanning one window of GGUF metadata for `tokenizer.chat_template`.
+#[derive(Debug, PartialEq, Eq)]
+enum TemplateScan {
+    /// The key does not appear (completely) in this window.
+    Absent,
+    /// The key is present, but its value runs past the end of this window.
+    Truncated,
+    /// The key is present with a zero length, so there is no template to read.
+    Invalid,
+    /// The template value, capped at [`MAX_GGUF_CHAT_TEMPLATE_BYTES`].
+    Found(String),
+}
+
+/// Parses the `tokenizer.chat_template` string entry in a metadata window. The key must be preceded by its
+/// own u64 length and followed by the string type code, so values and other keys that merely contain the
+/// text (for example `tokenizer.chat_template.tool_use`) are skipped.
+fn scan_gguf_chat_template(window: &[u8]) -> TemplateScan {
+    const PREFIX_LEN: usize = 8;
+    let key_len = GGUF_CHAT_TEMPLATE_KEY.len();
+    let key_prefix = (key_len as u64).to_le_bytes();
+    for (at, candidate) in window.windows(key_len).enumerate() {
+        if candidate != GGUF_CHAT_TEMPLATE_KEY || at < PREFIX_LEN {
+            continue;
+        }
+        if window[at - PREFIX_LEN..at] != key_prefix {
+            continue;
+        }
+        let rest = &window[at + key_len..];
+        let Some((kind, rest)) = rest.split_first_chunk::<4>() else {
+            return TemplateScan::Absent;
+        };
+        if u32::from_le_bytes(*kind) != GGUF_TYPE_STRING {
+            continue;
+        }
+        let Some((len, payload)) = rest.split_first_chunk::<8>() else {
+            return TemplateScan::Absent;
+        };
+        let len = u64::from_le_bytes(*len);
+        if len == 0 {
+            return TemplateScan::Invalid;
+        }
+        let wanted = usize::try_from(len).unwrap_or(usize::MAX).min(MAX_GGUF_CHAT_TEMPLATE_BYTES);
+        if payload.len() < wanted {
+            return TemplateScan::Truncated;
+        }
+        return TemplateScan::Found(String::from_utf8_lossy(&payload[..wanted]).into_owned());
+    }
+    TemplateScan::Absent
 }
 
 /// Maps non-2xx hub answers to the crate's error variants.
@@ -425,23 +517,89 @@ mod tests {
         assert!(matches!(huge, ModelHubError::BadResponse(_)), "{huge}");
     }
 
+    /// One GGUF string metadata entry: u64 key length, key, u32 type 8, u64 value length, value.
+    fn gguf_string_entry(key: &str, value: &[u8]) -> Vec<u8> {
+        let mut entry = (key.len() as u64).to_le_bytes().to_vec();
+        entry.extend_from_slice(key.as_bytes());
+        entry.extend_from_slice(&8u32.to_le_bytes());
+        entry.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        entry.extend_from_slice(value);
+        entry
+    }
+
+    const GEMMA_TEMPLATE: &str = "{%- macro format_parameters(p) %}<|\"|>{{ p }}<|\"|>{%- endmacro %}{{ tools }}";
+
     #[tokio::test]
-    async fn fetch_gguf_header_sample_asks_for_the_leading_range_and_treats_refusals_as_absent() {
+    async fn chat_template_past_the_first_window_is_found_on_the_second_request() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/org/model/resolve/main/model.gguf"))
             .and(header("range", "bytes=0-65535"))
-            .respond_with(ResponseTemplate::new(206).set_body_bytes(b"GGUF-header".to_vec()))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(vec![0u8; 64 * 1024]))
+            .expect(1)
             .mount(&server)
             .await;
+        let mut second = vec![0u8; 100 * 1024];
+        second.extend(gguf_string_entry("tokenizer.chat_template", GEMMA_TEMPLATE.as_bytes()));
         Mock::given(method("GET"))
-            .and(path("/org/full/resolve/main/model.gguf"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; GGUF_HEADER_SAMPLE_BYTES + 4096]))
+            .and(path("/org/model/resolve/main/model.gguf"))
+            .and(header("range", "bytes=0-524287"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(second))
+            .expect(1)
             .mount(&server)
             .await;
+
+        let client = HubClient::with_base_url(&server.uri()).unwrap();
+        let template = client
+            .fetch_gguf_chat_template(&reference("org/model"), "model.gguf")
+            .await
+            .unwrap();
+        assert_eq!(template.as_deref(), Some(GEMMA_TEMPLATE));
+        // Each window is requested at most once and the search stops at the first hit.
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_template_bytes_are_extracted_exactly_and_capped_at_32_kib() {
+        let server = MockServer::start().await;
+        let mut body = b"GGUF\x03\x00\x00\x00".to_vec();
+        body.extend(gguf_string_entry("general.name", b"demo"));
+        body.extend(gguf_string_entry("tokenizer.chat_template", GEMMA_TEMPLATE.as_bytes()));
+        body.extend(gguf_string_entry("tokenizer.ggml.model", b"llama"));
+        Mock::given(method("GET"))
+            .and(path("/org/exact/resolve/main/model.gguf"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(body))
+            .mount(&server)
+            .await;
+        let huge_template = "t".repeat(MAX_GGUF_CHAT_TEMPLATE_BYTES + 100);
+        let capped = gguf_string_entry("tokenizer.chat_template", huge_template.as_bytes());
+        Mock::given(method("GET"))
+            .and(path("/org/capped/resolve/main/model.gguf"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(capped))
+            .mount(&server)
+            .await;
+
+        let client = HubClient::with_base_url(&server.uri()).unwrap();
+        let exact = client
+            .fetch_gguf_chat_template(&reference("org/exact"), "model.gguf")
+            .await
+            .unwrap();
+        assert_eq!(exact.as_deref(), Some(GEMMA_TEMPLATE));
+        let cut = client
+            .fetch_gguf_chat_template(&reference("org/capped"), "model.gguf")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cut.len(), MAX_GGUF_CHAT_TEMPLATE_BYTES);
+        assert!(cut.bytes().all(|b| b == b't'));
+    }
+
+    #[tokio::test]
+    async fn refused_or_failed_gguf_reads_yield_no_template() {
+        let server = MockServer::start().await;
         for (route, status) in [
-            ("/org/refused/resolve/main/model.gguf", 416),
             ("/org/none/resolve/main/model.gguf", 404),
+            ("/org/refused/resolve/main/model.gguf", 416),
             ("/org/broken/resolve/main/model.gguf", 500),
         ] {
             Mock::given(method("GET"))
@@ -452,23 +610,57 @@ mod tests {
         }
 
         let client = HubClient::with_base_url(&server.uri()).unwrap();
-        let sample = client
-            .fetch_gguf_header_sample(&reference("org/model"), "model.gguf")
-            .await
-            .unwrap();
-        assert_eq!(sample, Some(b"GGUF-header".to_vec()));
-        let capped = client
-            .fetch_gguf_header_sample(&reference("org/full"), "model.gguf")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(capped.len(), GGUF_HEADER_SAMPLE_BYTES);
-        for repo in ["org/refused", "org/none", "org/broken"] {
-            let absent = client
-                .fetch_gguf_header_sample(&reference(repo), "model.gguf")
+        for repo in ["org/none", "org/refused", "org/broken"] {
+            let template = client
+                .fetch_gguf_chat_template(&reference(repo), "model.gguf")
                 .await
                 .unwrap();
-            assert_eq!(absent, None, "{repo}");
+            assert_eq!(template, None, "{repo}");
         }
+    }
+
+    #[tokio::test]
+    async fn key_with_a_bogus_length_yields_no_template_instead_of_an_error() {
+        let server = MockServer::start().await;
+        // Zero length, then a length longer than the bytes the file has left.
+        let mut zero = b"GGUF".to_vec();
+        zero.extend(gguf_string_entry("tokenizer.chat_template", b""));
+        let mut overrun = b"GGUF".to_vec();
+        overrun.extend(("tokenizer.chat_template".len() as u64).to_le_bytes());
+        overrun.extend_from_slice(b"tokenizer.chat_template");
+        overrun.extend_from_slice(&8u32.to_le_bytes());
+        overrun.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        overrun.extend_from_slice(b"short");
+        // The key is the last thing in the file: no length at all.
+        let mut missing = b"GGUF".to_vec();
+        missing.extend(("tokenizer.chat_template".len() as u64).to_le_bytes());
+        missing.extend_from_slice(b"tokenizer.chat_template");
+        for (repo, body) in [("org/zero", zero), ("org/overrun", overrun), ("org/missing", missing)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{repo}/resolve/main/model.gguf")))
+                .respond_with(ResponseTemplate::new(206).set_body_bytes(body))
+                .mount(&server)
+                .await;
+        }
+
+        let client = HubClient::with_base_url(&server.uri()).unwrap();
+        for repo in ["org/zero", "org/overrun", "org/missing"] {
+            let template = client
+                .fetch_gguf_chat_template(&reference(repo), "model.gguf")
+                .await
+                .unwrap();
+            assert_eq!(template, None, "{repo}");
+        }
+    }
+
+    #[test]
+    fn scan_skips_longer_keys_and_non_string_entries_with_the_same_text() {
+        let mut window = gguf_string_entry("tokenizer.chat_template.tool_use", b"plain");
+        window.extend(("tokenizer.chat_template".len() as u64).to_le_bytes());
+        window.extend_from_slice(b"tokenizer.chat_template");
+        window.extend_from_slice(&4u32.to_le_bytes());
+        window.extend_from_slice(&[0; 12]);
+        window.extend(gguf_string_entry("tokenizer.chat_template", b"{{ tools }}"));
+        assert_eq!(scan_gguf_chat_template(&window), TemplateScan::Found("{{ tools }}".into()));
     }
 }

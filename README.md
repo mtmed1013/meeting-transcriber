@@ -206,6 +206,16 @@ Para comprobar las fuentes en Windows sin cargar Whisper:
 .\venv\Scripts\python.exe windows_audio.py --check
 ```
 
+Para ver los nombres exactos de los dispositivos que Windows ofrece (los que
+aparecen en las listas de Configuración):
+
+```powershell
+.\venv\Scripts\python.exe windows_audio.py --list-devices
+```
+
+Imprime una línea JSON con `microphones` y `speakers`; vacío significa que la app
+usará el dispositivo predeterminado del sistema.
+
 Habla durante los primeros 15 segundos y reproduce una frase desde Windows
 durante los siguientes 15. Comprueba los picos por fuente; muestras recibidas no
 significan necesariamente sonido audible. La prueba no genera archivos de audio.

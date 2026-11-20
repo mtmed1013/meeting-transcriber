@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::assess::{chat_templates, gguf_chat_template};
+use crate::assess::{chat_template_from_gguf_bytes, chat_templates};
 use crate::error::ModelHubError;
 use crate::hub::GGUF_HEADER_SAMPLE_BYTES;
 
@@ -44,7 +44,7 @@ pub fn extract_suggested_config(
     config: Option<&Value>,
     generation_config: Option<&Value>,
     tokenizer_config: Option<&Value>,
-    gguf_header: Option<&[u8]>,
+    gguf_chat_template: Option<&str>,
 ) -> SuggestedModelConfig {
     let mut profile = SuggestedModelConfig::default();
     let mut sources: Vec<&str> = Vec::new();
@@ -71,16 +71,12 @@ pub fn extract_suggested_config(
     }
 
     let tokenizer_toggle = tokenizer_config.is_some_and(|config| {
-        chat_templates(config)
-            .into_iter()
-            .any(|template| template.contains(THINKING_TOGGLE_MARKER))
+        chat_templates(config).into_iter().any(declares_thinking_toggle)
     });
     if tokenizer_toggle {
         sources.push("tokenizer_config.json");
     }
-    let header_toggle = gguf_header
-        .and_then(gguf_chat_template)
-        .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains(THINKING_TOGGLE_MARKER));
+    let header_toggle = gguf_chat_template.is_some_and(declares_thinking_toggle);
     if header_toggle {
         sources.push("gguf header");
     }
@@ -120,8 +116,10 @@ pub fn load_local_suggested_config(model_path: &Path) -> SuggestedModelConfig {
         if let Some(saved) = read_saved_profile(&gguf_sidecar_path(model_path)) {
             return saved;
         }
-        let header = read_gguf_header_sample(model_path);
-        return extract_suggested_config(None, None, None, header.as_deref());
+        let template = read_gguf_header_sample(model_path)
+            .as_deref()
+            .and_then(chat_template_from_gguf_bytes);
+        return extract_suggested_config(None, None, None, template.as_deref());
     }
     extract_suggested_config(None, None, None, None)
 }
@@ -141,6 +139,11 @@ pub fn save_local_suggested_config(
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     fs::write(target, json)?;
     Ok(())
+}
+
+/// True when a chat template contains the thinking switch, matched case-insensitively.
+fn declares_thinking_toggle(template: &str) -> bool {
+    template.to_ascii_lowercase().contains(THINKING_TOGGLE_MARKER)
 }
 
 fn finite_non_negative(value: &Value, key: &str) -> Option<f32> {
@@ -251,8 +254,7 @@ mod tests {
         assert!(from_list.supports_thinking_toggle);
         assert_eq!(from_list.recommended_thinking, Some(false));
 
-        let header = gguf_header_with_template(THINKING_TEMPLATE);
-        let from_header = extract_suggested_config(None, None, None, Some(&header));
+        let from_header = extract_suggested_config(None, None, None, Some(THINKING_TEMPLATE));
         assert!(from_header.supports_thinking_toggle);
         assert_eq!(from_header.recommended_thinking, Some(false));
         assert_eq!(from_header.source_summary, "gguf header");
@@ -264,6 +266,15 @@ mod tests {
         let profile = extract_suggested_config(None, None, Some(&tokenizer), None);
         assert!(!profile.supports_thinking_toggle);
         assert_eq!(profile.recommended_thinking, None);
+    }
+
+    #[test]
+    fn thinking_marker_is_matched_case_insensitively_in_the_gguf_template() {
+        let upper = extract_suggested_config(None, None, None, Some("{% if ENABLE_THINKING %}"));
+        assert!(upper.supports_thinking_toggle);
+        assert_eq!(upper.recommended_thinking, Some(false));
+        let plain = extract_suggested_config(None, None, None, Some("{{ messages }}"));
+        assert!(!plain.supports_thinking_toggle);
     }
 
     #[test]

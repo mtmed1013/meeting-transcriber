@@ -214,15 +214,18 @@
             <div class="ui-card">
               <div class="ui-row">
                 <div class="ui-text"><label class="ui-label" for="windowsMicrophone">Micrófono</label><span class="ui-hint">Nombre del dispositivo de entrada. Vacío usa el predeterminado.</span></div>
-                <input class="ui-input" type="text" id="windowsMicrophone" autocomplete="off" />
+                <select class="ui-select" id="windowsMicrophone"></select>
               </div>
               <div class="ui-row">
                 <div class="ui-text"><label class="ui-label" for="windowsSpeaker">Altavoz o salida del sistema</label><span class="ui-hint">Dispositivo de salida cuyo audio se captura. Vacío usa el predeterminado.</span></div>
-                <input class="ui-input" type="text" id="windowsSpeaker" autocomplete="off" />
+                <select class="ui-select" id="windowsSpeaker"></select>
               </div>
               <div class="ui-row">
                 <div class="ui-text"><label class="ui-label" for="windowsBufferSeconds">Buffer (segundos)</label><span class="ui-hint">Mínimo 0.2 s. Más buffer evita cortes, pero añade retraso.</span></div>
                 <input class="ui-input ui-input--num" type="number" id="windowsBufferSeconds" min="0.2" step="0.1" inputmode="decimal" />
+              </div>
+              <div class="ui-row">
+                <span class="ui-hint" id="windowsDevicesHint" role="status"></span>
               </div>
             </div>
           </div>
@@ -515,6 +518,7 @@
           runtime: null,
           hub: { phase: "idle" },
           analyzePath: "",
+          windowsDevices: { microphones: [], speakers: [] },
           snapshot: DEFAULT_SNAPSHOT,
           clockBase: 0,
           clockAt: Date.now(),
@@ -536,6 +540,7 @@
           // Save applies to the four settings tabs only; the Sesión tab has no form to save.
           document.querySelector(".settings-footer").hidden = (name === "session");
           document.querySelector(".settings-main").scrollTop = 0;
+          if (name === "stt") refreshWindowsDevices();
         }
 
         // ---------- Session: live state ----------
@@ -705,8 +710,7 @@
           updateSttVisibility();
           $("macSystemGain").value = v.macSystemGain;
           $("macMicrophoneGain").value = v.macMicrophoneGain;
-          $("windowsMicrophone").value = v.windowsMicrophone || "";
-          $("windowsSpeaker").value = v.windowsSpeaker || "";
+          refreshWindowsDevices(v.windowsMicrophone || "", v.windowsSpeaker || "");
           $("windowsBufferSeconds").value = v.windowsBufferSeconds;
           $("platformMac").hidden = v.platformOs !== "macos";
           $("platformWin").hidden = v.platformOs !== "windows";
@@ -870,6 +874,56 @@
           badge.textContent = s.installed ? "Instalado" : "No instalado";
         }
 
+        // ---------- Windows audio devices ----------
+
+        // The system default first, then the detected devices, then the saved value when it is not detected (so it is not lost).
+        function setDeviceOptions(select, names, saved) {
+          var options = [el("option", { value: "" }, "Predeterminado (recomendado)")];
+          names.forEach(function (name) { options.push(el("option", { value: name }, name)); });
+          if (saved && names.indexOf(saved) < 0) {
+            options.push(el("option", { value: saved }, saved + " (no disponible)"));
+          }
+          select.replaceChildren.apply(select, options);
+          select.value = saved || "";
+        }
+
+        function paintWindowsDevices(mic, spk) {
+          setDeviceOptions($("windowsMicrophone"), state.windowsDevices.microphones, mic);
+          setDeviceOptions($("windowsSpeaker"), state.windowsDevices.speakers, spk);
+        }
+
+        var windowsDevicesRequest = 0;
+        // Explicit values come from render(v); otherwise the current selection is kept. The dropdowns are
+        // painted on every platform so buildUpdate() keeps the saved values; only the listing is Windows-only.
+        async function refreshWindowsDevices(mic, spk) {
+          var request = ++windowsDevicesRequest;
+          var pick = function () {
+            return {
+              mic: mic !== undefined ? mic : $("windowsMicrophone").value,
+              spk: spk !== undefined ? spk : $("windowsSpeaker").value
+            };
+          };
+          var current = pick();
+          paintWindowsDevices(current.mic, current.spk);
+          if (!state.view || state.view.platformOs !== "windows") return;
+          var hint = $("windowsDevicesHint");
+          try {
+            var found = await M.invoke("list_windows_audio_devices");
+            if (request !== windowsDevicesRequest) return;
+            state.windowsDevices = {
+              microphones: Array.isArray(found && found.microphones) ? found.microphones : [],
+              speakers: Array.isArray(found && found.speakers) ? found.speakers : []
+            };
+            hint.textContent = (found && found.detail) || "";
+          } catch (e) {
+            if (request !== windowsDevicesRequest) return;
+            state.windowsDevices = { microphones: [], speakers: [] };
+            hint.textContent = errText(e);
+          }
+          current = pick();
+          paintWindowsDevices(current.mic, current.spk);
+        }
+
         async function installStt() {
           if (state.busy.stt) return;
           state.busy.stt = true;
@@ -884,6 +938,7 @@
             $("sttProgressBar").style.width = "100%";
             renderStt(status);
             if (state.view) renderSessionSummary(state.view);
+            refreshWindowsDevices();
             setStatus($("sttProgressText"), "Motor de transcripción listo.", "ok");
           } catch (e) {
             $("sttProgress").classList.remove("ui-progress--indeterminate");
@@ -1155,6 +1210,20 @@
 
         // ---------- AI: Hugging Face hub ----------
 
+        var TOOL_LABELS = {
+          supported: "soporta tools",
+          unsupported: "sin soporte de tools",
+          unknown: "tools sin verificar (GGUF)"
+        };
+
+        // Tri-state from the backend; falls back to the derived boolean when toolSupport is missing.
+        function toolSupportState(info) {
+          var s = info.toolSupport;
+          if (s === "supported" || s === "unsupported" || s === "unknown") return s;
+          if (info.format && typeof info.supportsTools === "boolean") return info.supportsTools ? "supported" : "unsupported";
+          return "";
+        }
+
         function renderHub(snapshot) {
           var hub = (state.hub = snapshot || { phase: "idle" });
           var phase = hub.phase;
@@ -1169,9 +1238,8 @@
           if (info) {
             var files = info.files || [];
             // Tool-calling support is shown only when the backend reports it; an absent field is not "sin soporte".
-            var toolsLabel = info.format && typeof info.supportsTools === "boolean"
-              ? (info.supportsTools ? "soporta tools" : "sin soporte de tools")
-              : "";
+            var toolState = toolSupportState(info);
+            var toolsLabel = TOOL_LABELS[toolState] || "";
             $("hubTitle").textContent = info.repoId;
             $("hubMeta").textContent = [
               M.formatBytes(info.totalBytes),
@@ -1185,7 +1253,10 @@
             $("hubFit").className = "ui-badge " + fit.cls;
             $("hubFit").textContent = fit.label;
             $("hubVerdict").textContent = info.verdict || "";
-            $("hubVerdict").className = "ui-status " + (canInstall ? fit.status : "ui-status--error");
+            // An installable model with unverified tools (GGUF metadata unreadable) is amber, not blocked.
+            var verdictTone = canInstall ? fit.status : "ui-status--error";
+            if (canInstall && toolState === "unknown") verdictTone = "ui-status--warn";
+            $("hubVerdict").className = "ui-status " + verdictTone;
           }
 
           var options = (info && info.ggufOptions) || [];

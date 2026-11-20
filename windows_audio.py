@@ -1,7 +1,12 @@
 """Independent shared-mode WASAPI readers and a bounded-latency mixer."""
 
+import argparse
+import contextlib
 import ctypes
+import json
+import os
 import queue
+import sys
 import threading
 import time
 import warnings
@@ -292,14 +297,48 @@ def capture(output_queue, stop_event, error_queue, rate=16000,
         print(f"📊 Captura cerrada: audio pendiente en cola={pending:.1f}s")
 
 
-if __name__ == "__main__":
-    import os
-    import argparse
+def unique_names(devices):
+    """Stripped device names in first-seen order, without duplicates or blanks."""
+    names = []
+    for device in devices:
+        name = str(device.name).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def list_devices():
+    """Return device names as JSON-ready data; never opens an audio device."""
+    try:
+        import soundcard as sc
+
+        # Keep SoundCard diagnostics off stdout: stdout carries only the JSON line.
+        with contextlib.redirect_stdout(sys.stderr):
+            microphones = unique_names(sc.all_microphones(include_loopback=False))
+            speakers = unique_names(sc.all_speakers())
+    except Exception as error:
+        message = str(error) or type(error).__name__
+        print(f"⚠️ No se pudieron listar dispositivos de audio: {message}", file=sys.stderr)
+        return {"microphones": [], "speakers": [], "error": message}
+    return {"microphones": microphones, "speakers": speakers}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Prueba de fuentes WASAPI sin cargar Whisper")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check", action="store_true",
+                      help="captura 30 s de micrófono y loopback para comprobar los picos")
+    mode.add_argument("--list-devices", action="store_true",
+                      help="imprime en JSON los micrófonos y altavoces disponibles")
+    args = parser.parse_args(argv)
+
+    if args.list_devices:
+        # ASCII-escaped so a non-UTF-8 Windows pipe cannot break the single JSON line.
+        print(json.dumps(list_devices()))
+        return 0
+
     from dotenv import load_dotenv
 
-    parser = argparse.ArgumentParser(description="Prueba de fuentes WASAPI sin cargar Whisper")
-    parser.add_argument("--check", action="store_true", required=True)
-    parser.parse_args()
     load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
     print("Primeros 15s: habla por el micrófono. Siguientes 15s: reproduce una frase en Windows.")
     print("Comprueba el pico de cada fuente. Esta prueba no guarda audio ni genera una nota.")
@@ -317,3 +356,8 @@ if __name__ == "__main__":
         timer.cancel()
     while not errors.empty():
         print(f"❌ {errors.get()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

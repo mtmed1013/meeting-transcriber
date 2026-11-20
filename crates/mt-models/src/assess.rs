@@ -24,16 +24,20 @@ const NO_FORMAT_NOTE: &str =
     "No se puede instalar: el repositorio no tiene pesos MLX (.safetensors con config.json) ni archivos GGUF.";
 const NO_TOOL_NOTE: &str =
     "No se puede instalar: este modelo no declara soporte para herramientas (tool calling) en su plantilla de chat o metadatos de Hugging Face.";
+const UNKNOWN_TOOL_NOTE: &str =
+    "No se pudo verificar el soporte de herramientas en el archivo GGUF; se permite la descarga, pero el informe puede fallar si el modelo no soporta tools.";
 /// Hub tags that declare tool calling (compared case-insensitively).
 const TOOL_TAGS: [&str; 3] = ["tool-use", "function-calling", "tools"];
-/// Chat-template fragments that show a template renders tool definitions or tool calls.
-const TOOL_MARKERS: [&str; 6] = [
+/// Chat-template fragments that show a template renders tool definitions or tool calls. Lowercase: the
+/// template is lowercased before matching.
+const TOOL_MARKERS: [&str; 7] = [
     "tools",
     "tool_call",
     "<tool_call>",
-    "[AVAILABLE_TOOLS]",
-    "tool_calls",
+    "[available_tools]",
     "function_call",
+    "format_parameters(",
+    "<|\"|>",
 ];
 /// GGUF metadata key holding the embedded chat template.
 const GGUF_CHAT_TEMPLATE_KEY: &[u8] = b"tokenizer.chat_template";
@@ -66,6 +70,18 @@ pub enum Blocker {
     NoToolSupport,
 }
 
+/// Whether the model declares tool calling. `Unknown` means no template could be read to decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolSupport {
+    /// A matching hub tag or a chat template that renders tools.
+    Supported,
+    /// A chat template was read and it renders no tools.
+    Unsupported,
+    /// No hub tag and no chat template (tokenizer or GGUF) was available.
+    Unknown,
+}
+
 /// Input for [`assess`].
 #[derive(Debug, Clone, Copy)]
 pub struct AssessRequest<'a> {
@@ -77,8 +93,8 @@ pub struct AssessRequest<'a> {
     pub generation_config: Option<&'a serde_json::Value>,
     /// Optional `tokenizer_config.json`, scanned for a tool-calling chat template.
     pub tokenizer_config: Option<&'a serde_json::Value>,
-    /// Leading bytes of a GGUF file, scanned for an embedded `tokenizer.chat_template`.
-    pub gguf_header: Option<&'a [u8]>,
+    /// Chat template embedded in a GGUF file (`tokenizer.chat_template`), as plain text.
+    pub gguf_chat_template: Option<&'a str>,
     pub machine: &'a MachineInfo,
     /// Explicit GGUF file; `None` lets the planner choose.
     pub gguf_filename: Option<&'a str>,
@@ -105,8 +121,8 @@ pub struct Assessment {
     pub disk_free_bytes: u64,
     /// True when several GGUF quantizations exist and none was chosen.
     pub needs_selection: bool,
-    /// True when the repository declares tool calling (see [`detect_tool_support`]).
-    pub supports_tools: bool,
+    /// Tool calling as declared by the repository (see [`detect_tool_support`]).
+    pub tool_support: ToolSupport,
     /// Suggested runtime settings (see [`extract_suggested_config`]).
     pub suggested_config: SuggestedModelConfig,
     /// Human-readable explanation in Spanish.
@@ -121,11 +137,16 @@ impl Assessment {
             && self.disk_ok
             && self.fit != Fit::TooBig
     }
+
+    /// False only when the repository is known not to support tool calling; `Unknown` counts as allowed.
+    pub fn supports_tools(&self) -> bool {
+        self.tool_support != ToolSupport::Unsupported
+    }
 }
 
 /// Assesses one model against one machine.
 pub fn assess(req: &AssessRequest<'_>) -> Assessment {
-    let supports_tools = detect_tool_support(req.info, req.tokenizer_config, req.gguf_header);
+    let tool_support = detect_tool_support(req.info, req.tokenizer_config, req.gguf_chat_template);
     let format = match inspect_repo_format(req.info) {
         Ok(format) => format,
         Err(_) => {
@@ -137,7 +158,7 @@ pub fn assess(req: &AssessRequest<'_>) -> Assessment {
                     weights_bytes: 0,
                     evaluable: false,
                     needs_selection: false,
-                    supports_tools,
+                    tool_support,
                     notes: vec![NO_FORMAT_NOTE.to_string()],
                 },
             );
@@ -164,9 +185,15 @@ pub fn assess(req: &AssessRequest<'_>) -> Assessment {
         }
     };
     // Platform and file-layout blockers keep priority; the tool check only applies to installable models.
-    if evaluable && blocker.is_none() && !supports_tools {
-        blocker = Some(Blocker::NoToolSupport);
-        notes.push(NO_TOOL_NOTE.to_string());
+    match tool_support {
+        ToolSupport::Unsupported if evaluable && blocker.is_none() => {
+            blocker = Some(Blocker::NoToolSupport);
+            notes.push(NO_TOOL_NOTE.to_string());
+        }
+        ToolSupport::Unknown if evaluable => {
+            notes.push(UNKNOWN_TOOL_NOTE.to_string());
+        }
+        _ => {}
     }
 
     let needs_selection = format == ModelFormat::Gguf
@@ -180,32 +207,40 @@ pub fn assess(req: &AssessRequest<'_>) -> Assessment {
             weights_bytes,
             evaluable,
             needs_selection,
-            supports_tools,
+            tool_support,
             notes,
         },
     )
 }
 
-/// True when the repository declares tool calling: a matching hub tag, a tool-calling chat template in
-/// `tokenizer_config.json`, or one embedded in the GGUF header sample.
+/// Tool calling from the hub tags, the chat templates of `tokenizer_config.json`, and the GGUF chat template.
+/// A matching tag or any template that renders tools is `Supported`; otherwise a template that was read is
+/// `Unsupported`, and no template at all is `Unknown`.
 pub fn detect_tool_support(
     info: &RepoInfo,
     tokenizer_config: Option<&serde_json::Value>,
-    gguf_header: Option<&[u8]>,
-) -> bool {
+    gguf_chat_template: Option<&str>,
+) -> ToolSupport {
     let tagged = info
         .tags
         .iter()
         .any(|tag| TOOL_TAGS.iter().any(|known| tag.eq_ignore_ascii_case(known)));
-    tagged
-        || tokenizer_config.is_some_and(|config| {
-            chat_templates(config)
-                .into_iter()
-                .any(template_declares_tools)
-        })
-        || gguf_header
-            .and_then(gguf_chat_template)
-            .is_some_and(|bytes| template_declares_tools(&String::from_utf8_lossy(bytes)))
+    if tagged {
+        return ToolSupport::Supported;
+    }
+    let templates: Vec<&str> = tokenizer_config
+        .map(chat_templates)
+        .unwrap_or_default()
+        .into_iter()
+        .chain(gguf_chat_template)
+        .collect();
+    if templates.iter().any(|template| template_declares_tools(template)) {
+        ToolSupport::Supported
+    } else if templates.is_empty() {
+        ToolSupport::Unknown
+    } else {
+        ToolSupport::Unsupported
+    }
 }
 
 /// Chat templates of a `tokenizer_config.json`: a single string, or a list of `{ "template": ... }`.
@@ -221,12 +256,13 @@ pub(crate) fn chat_templates(config: &serde_json::Value) -> Vec<&str> {
 }
 
 fn template_declares_tools(template: &str) -> bool {
-    TOOL_MARKERS.iter().any(|marker| template.contains(marker))
+    let lowered = template.to_ascii_lowercase();
+    TOOL_MARKERS.iter().any(|marker| lowered.contains(marker))
 }
 
-/// The value of `tokenizer.chat_template` in a GGUF header sample, when it is a string value.
-/// The value follows the key as a little-endian `u32` type (8 = string) and a `u64` byte length.
-pub(crate) fn gguf_chat_template(header: &[u8]) -> Option<&[u8]> {
+/// The value of `tokenizer.chat_template` in GGUF metadata bytes (a file's leading sample), when it is a
+/// string value. The value follows the key as a little-endian `u32` type (8 = string) and a `u64` byte length.
+pub(crate) fn chat_template_from_gguf_bytes(header: &[u8]) -> Option<String> {
     const GGUF_TYPE_STRING: u32 = 8;
     // A key is stored as a u64 length followed by its bytes, so the length prefix pins the exact key:
     // `tokenizer.chat_template.tool_use` contains the same bytes but has a different length.
@@ -245,7 +281,7 @@ pub(crate) fn gguf_chat_template(header: &[u8]) -> Option<&[u8]> {
     let (len, body) = rest.split_first_chunk::<8>()?;
     let len = usize::try_from(u64::from_le_bytes(*len)).unwrap_or(usize::MAX);
     // The sample may end inside a long template; scan what was received.
-    Some(&body[..len.min(body.len())])
+    Some(String::from_utf8_lossy(&body[..len.min(body.len())]).into_owned())
 }
 
 /// Platform and CPU architecture check, with the Spanish explanation when blocked.
@@ -290,7 +326,7 @@ struct AssessmentDraft {
     weights_bytes: u64,
     evaluable: bool,
     needs_selection: bool,
-    supports_tools: bool,
+    tool_support: ToolSupport,
     notes: Vec<String>,
 }
 
@@ -302,7 +338,7 @@ fn build_assessment(req: &AssessRequest<'_>, draft: AssessmentDraft) -> Assessme
         weights_bytes,
         evaluable,
         needs_selection,
-        supports_tools,
+        tool_support,
         notes,
     } = draft;
     let machine = req.machine;
@@ -342,12 +378,12 @@ fn build_assessment(req: &AssessRequest<'_>, draft: AssessmentDraft) -> Assessme
         disk_ok,
         disk_free_bytes: machine.disk_free_bytes,
         needs_selection,
-        supports_tools,
+        tool_support,
         suggested_config: extract_suggested_config(
             req.config,
             req.generation_config,
             req.tokenizer_config,
-            req.gguf_header,
+            req.gguf_chat_template,
         ),
         verdict: parts.join(" "),
     }
@@ -484,9 +520,9 @@ mod tests {
         machine: &MachineInfo,
         config: Option<&serde_json::Value>,
         tokenizer_config: Option<&serde_json::Value>,
-        gguf_header: Option<&[u8]>,
+        gguf_chat_template: Option<&str>,
     ) -> Assessment {
-        assess_full(info, machine, config, None, tokenizer_config, gguf_header)
+        assess_full(info, machine, config, None, tokenizer_config, gguf_chat_template)
     }
 
     fn assess_full(
@@ -495,7 +531,7 @@ mod tests {
         config: Option<&serde_json::Value>,
         generation_config: Option<&serde_json::Value>,
         tokenizer_config: Option<&serde_json::Value>,
-        gguf_header: Option<&[u8]>,
+        gguf_chat_template: Option<&str>,
     ) -> Assessment {
         let reference = RepoRef { repo_id: "org/model".into(), revision: "main".into() };
         assess(&AssessRequest {
@@ -504,7 +540,7 @@ mod tests {
             config,
             generation_config,
             tokenizer_config,
-            gguf_header,
+            gguf_chat_template,
             machine,
             gguf_filename: None,
             context_tokens: DEFAULT_CONTEXT_TOKENS,
@@ -580,7 +616,7 @@ mod tests {
         let info = repo(&[("model-Q4_K_M.gguf", GIB)]);
         let tokenizer = json!({ "chat_template": TOOL_TEMPLATE });
         let result = assess_request(&info, &machine("macos", "aarch64", 16, 100), None, Some(&tokenizer), None);
-        assert!(result.supports_tools);
+        assert_eq!(result.tool_support, ToolSupport::Supported);
         assert_eq!(result.blocker, None, "{}", result.verdict);
         assert!(result.can_install(), "{}", result.verdict);
     }
@@ -593,14 +629,14 @@ mod tests {
                 { "name": "tool_use", "template": "<tool_call>{{ call }}</tool_call>" }
             ]
         });
-        assert!(detect_tool_support(&repo(&[]), Some(&tokenizer), None));
+        assert_eq!(detect_tool_support(&repo(&[]), Some(&tokenizer), None), ToolSupport::Supported);
     }
 
     #[test]
     fn tool_use_tag_passes_the_tool_check_whatever_the_casing() {
         let info = with_tags(repo(&[("model-Q4_K_M.gguf", GIB)]), &["Text-Generation", "Tool-Use"]);
         let result = assess_with(&info, &machine("macos", "aarch64", 16, 100), None);
-        assert!(result.supports_tools);
+        assert_eq!(result.tool_support, ToolSupport::Supported);
         assert!(result.can_install(), "{}", result.verdict);
     }
 
@@ -608,8 +644,9 @@ mod tests {
     fn gguf_header_chat_template_with_tools_passes_the_tool_check() {
         let info = repo(&[("model-Q4_K_M.gguf", GIB)]);
         let header = gguf_header_with_template(TOOL_TEMPLATE);
-        let result = assess_request(&info, &machine("windows", "x86_64", 16, 100), None, None, Some(&header));
-        assert!(result.supports_tools);
+        let template = chat_template_from_gguf_bytes(&header);
+        let result = assess_request(&info, &machine("windows", "x86_64", 16, 100), None, None, template.as_deref());
+        assert_eq!(result.tool_support, ToolSupport::Supported);
         assert!(result.can_install(), "{}", result.verdict);
     }
 
@@ -619,9 +656,11 @@ mod tests {
         let info = repo(&[("model-Q4_K_M.gguf", GIB)]);
         let mut vocabulary = b"tokenizer.ggml.tokens".to_vec();
         vocabulary.extend_from_slice(b"<tool_call> tools tool_calls function_call");
-        assert!(!detect_tool_support(&info, None, Some(&vocabulary)));
+        assert_eq!(chat_template_from_gguf_bytes(&vocabulary), None);
+        assert_eq!(detect_tool_support(&info, None, None), ToolSupport::Unknown);
         let plain = gguf_header_with_template("{{ messages }}");
-        assert!(!detect_tool_support(&info, None, Some(&plain)));
+        let template = chat_template_from_gguf_bytes(&plain);
+        assert_eq!(detect_tool_support(&info, None, template.as_deref()), ToolSupport::Unsupported);
     }
 
     #[test]
@@ -631,12 +670,16 @@ mod tests {
         let mut header = b"GGUF\x03\x00\x00\x00".to_vec();
         header.extend(gguf_string_entry("tokenizer.chat_template.tool_use", "plain"));
         header.extend(gguf_string_entry("tokenizer.chat_template", TOOL_TEMPLATE));
-        assert!(detect_tool_support(&info, None, Some(&header)));
+        let template = chat_template_from_gguf_bytes(&header);
+        assert_eq!(template.as_deref(), Some(TOOL_TEMPLATE));
+        assert_eq!(detect_tool_support(&info, None, template.as_deref()), ToolSupport::Supported);
 
         let mut plain = b"GGUF\x03\x00\x00\x00".to_vec();
         plain.extend(gguf_string_entry("tokenizer.chat_template.tool_use", TOOL_TEMPLATE));
         plain.extend(gguf_string_entry("tokenizer.chat_template", "{{ messages }}"));
-        assert!(!detect_tool_support(&info, None, Some(&plain)));
+        let template = chat_template_from_gguf_bytes(&plain);
+        assert_eq!(template.as_deref(), Some("{{ messages }}"));
+        assert_eq!(detect_tool_support(&info, None, template.as_deref()), ToolSupport::Unsupported);
     }
 
     #[test]
@@ -644,7 +687,8 @@ mod tests {
         let info = repo(&[("model-Q4_K_M.gguf", GIB)]);
         let tokenizer = json!({ "chat_template": "{{ messages }}" });
         let result = assess_request(&info, &machine("macos", "aarch64", 16, 100), None, Some(&tokenizer), None);
-        assert!(!result.supports_tools);
+        assert_eq!(result.tool_support, ToolSupport::Unsupported);
+        assert!(!result.supports_tools());
         assert_eq!(result.blocker, Some(Blocker::NoToolSupport));
         assert!(!result.can_install());
         assert!(
@@ -679,5 +723,51 @@ mod tests {
         let info = repo(&[("model.safetensors", GIB), ("config.json", 1)]);
         let result = assess_with(&info, &machine("windows", "x86_64", 16, 100), None);
         assert_eq!(result.blocker, Some(Blocker::UnsupportedPlatform));
+    }
+
+    #[test]
+    fn gemma4_tool_call_syntax_is_supported_and_installable() {
+        let info = repo(&[("model-Q4_K_M.gguf", GIB)]);
+        let template = r#"{{ format_parameters(tool.parameters) }}<|"|>{{ call }}<|"|>"#;
+        let tokenizer = json!({ "chat_template": template });
+        assert_eq!(detect_tool_support(&info, Some(&tokenizer), None), ToolSupport::Supported);
+        let result = assess_request(&info, &machine("macos", "aarch64", 16, 100), None, Some(&tokenizer), None);
+        assert_eq!(result.tool_support, ToolSupport::Supported);
+        assert_eq!(result.blocker, None, "{}", result.verdict);
+        assert!(result.can_install(), "{}", result.verdict);
+    }
+
+    #[test]
+    fn uppercase_tools_marker_is_supported() {
+        let tokenizer = json!({ "chat_template": "{% if TOOLS %}{{ TOOLS }}{% endif %}" });
+        assert_eq!(detect_tool_support(&repo(&[]), Some(&tokenizer), None), ToolSupport::Supported);
+    }
+
+    #[test]
+    fn template_without_markers_is_unsupported_and_cannot_install() {
+        let info = repo(&[("model-Q4_K_M.gguf", GIB)]);
+        let template = "{{ messages }}";
+        let tokenizer = json!({ "chat_template": template });
+        assert_eq!(detect_tool_support(&info, Some(&tokenizer), None), ToolSupport::Unsupported);
+        let result = assess_request(&info, &machine("macos", "aarch64", 16, 100), None, None, Some(template));
+        assert_eq!(result.tool_support, ToolSupport::Unsupported);
+        assert!(!result.supports_tools());
+        assert_eq!(result.blocker, Some(Blocker::NoToolSupport));
+        assert!(!result.can_install(), "{}", result.verdict);
+    }
+
+    #[test]
+    fn missing_template_is_unknown_and_stays_installable_with_a_warning() {
+        let info = repo(&[("model-Q4_K_M.gguf", GIB)]);
+        let result = assess_with(&info, &machine("macos", "aarch64", 16, 100), None);
+        assert_eq!(result.tool_support, ToolSupport::Unknown);
+        assert!(result.supports_tools());
+        assert_eq!(result.blocker, None, "{}", result.verdict);
+        assert!(result.can_install(), "{}", result.verdict);
+        assert!(
+            result.verdict.contains("No se pudo verificar el soporte de herramientas en el archivo GGUF; se permite la descarga, pero el informe puede fallar si el modelo no soporta tools."),
+            "{}",
+            result.verdict
+        );
     }
 }
