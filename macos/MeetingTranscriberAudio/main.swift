@@ -15,13 +15,24 @@ final class FramedAudioWriter {
     private let queue = DispatchQueue(label: "meeting-transcriber.audio-writer")
     private let output = FileHandle.standardOutput
 
-    func write(samples: [Float32], source: UInt8) {
+    func write(samples: [Float32], source: UInt8, presentationTime: CMTime) {
         guard !samples.isEmpty else { return }
 
         let sampleDuration = UInt64(
             (Double(samples.count) / Double(targetSampleRate)) * 1_000_000_000
         )
-        var timestamp = DispatchTime.now().uptimeNanoseconds &- sampleDuration
+        // Callbacks can arrive in bursts: arrival time is not audio time.
+        // Map CoreMedia's host-clock PTS to the monotonic clock used by Python.
+        let now = DispatchTime.now().uptimeNanoseconds
+        let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
+        let offset = CMTimeGetSeconds(CMTimeSubtract(presentationTime, hostNow))
+        var timestamp = now &- sampleDuration
+        if presentationTime.isValid && offset.isFinite {
+            let mapped = Double(now) + offset * 1_000_000_000
+            if mapped >= 0 && mapped < Double(UInt64.max) {
+                timestamp = UInt64(mapped.rounded())
+            }
+        }
 
         queue.sync {
             var count = UInt32(samples.count).littleEndian
@@ -99,7 +110,11 @@ final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate {
 #else
         let source = systemAudioSource
 #endif
-        writer.write(samples: samples, source: source)
+        writer.write(
+            samples: samples,
+            source: source,
+            presentationTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        )
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

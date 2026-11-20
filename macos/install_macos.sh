@@ -61,8 +61,13 @@ pattern = re.compile(
     r"(?im)^([ \t]*TRANSCRIPTION_ENGINE[ \t]*=[ \t]*)(?:canary|nemotron)"
     r"(?=[ \t]*(?:#[^\r\n]*)?(?:\r?$))"
 )
-updated, count = pattern.subn(r"\1whisper", contents)
-if count:
+updated, engine_count = pattern.subn(r"\1auto", contents)
+model_pattern = re.compile(
+    r"(?im)^([ \t]*WHISPER_MODEL[ \t]*=[ \t]*)medium"
+    r"(?=[ \t]*(?:#[^\r\n]*)?(?:\r?$))"
+)
+updated, model_count = model_pattern.subn(r"\1small", updated)
+if engine_count or model_count:
     fd, temporary_path = tempfile.mkstemp(prefix=".env.", dir=env_path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as output:
@@ -75,7 +80,10 @@ if count:
         except FileNotFoundError:
             pass
         raise
-    print("TRANSCRIPTION_ENGINE antiguo migrado a whisper en .env.")
+    if engine_count:
+        print("Motor antiguo migrado a auto en .env.")
+    if model_count:
+        print("WHISPER_MODEL medium migrado a small en .env.")
 PY
 fi
 
@@ -90,8 +98,53 @@ for obsolete_model in \
   fi
 done
 
-echo "Descargando y verificando el modelo Whisper configurado..."
-"$VENV_PYTHON" -c "from dotenv import load_dotenv; import os; from faster_whisper import WhisperModel; load_dotenv('.env'); name = os.getenv('WHISPER_MODEL', '').strip() or 'medium'; print(f'Modelo: {name}'); WhisperModel(name, device='cpu', compute_type='int8'); print('Modelo listo.')"
+if [[ "$MACOS_ARCH" == "arm64" ]]; then
+  MODEL_DIR="$PROJECT_DIR/models"
+  WHISTLE_MODEL="$MODEL_DIR/whistle.cact"
+  WHISTLE_SHA256="b6e02f048568ac5d01a2042556c658061e699acbc0aa2a1439f52f3d461dffeb"
+  WHISTLE_URL="https://huggingface.co/Cactus-Compute/whistle/resolve/b358ddadd89b7a713b5aa131f23032d3cca1b251/whistle.cact"
+  mkdir -p "$MODEL_DIR"
+
+  CURRENT_WHISTLE_HASH=""
+  if [[ -f "$WHISTLE_MODEL" ]]; then
+    CURRENT_WHISTLE_HASH="$(shasum -a 256 "$WHISTLE_MODEL" | awk '{print $1}')"
+  fi
+  if [[ "$CURRENT_WHISTLE_HASH" != "$WHISTLE_SHA256" ]]; then
+    if ! command -v curl >/dev/null 2>&1; then
+      echo "No se encontró curl, necesario para descargar whistle.cact."
+      exit 1
+    fi
+    TEMP_WHISTLE="$(mktemp "$MODEL_DIR/.whistle.XXXXXX")"
+    if ! curl --fail --location --retry 3 --output "$TEMP_WHISTLE" "$WHISTLE_URL"; then
+      rm -f "$TEMP_WHISTLE"
+      echo "No se pudo descargar Cactus Whistle."
+      exit 1
+    fi
+    DOWNLOADED_WHISTLE_HASH="$(shasum -a 256 "$TEMP_WHISTLE" | awk '{print $1}')"
+    if [[ "$DOWNLOADED_WHISTLE_HASH" != "$WHISTLE_SHA256" ]]; then
+      rm -f "$TEMP_WHISTLE"
+      echo "La verificación SHA-256 de whistle.cact falló."
+      exit 1
+    fi
+    mv -f "$TEMP_WHISTLE" "$WHISTLE_MODEL"
+  fi
+
+  NEEDLE_CLI="$PROJECT_DIR/venv/bin/needle"
+  if [[ ! -x "$NEEDLE_CLI" ]]; then
+    echo "No se encontró Needle en el entorno virtual ARM64."
+    echo "Verifica la versión de Python y vuelve a ejecutar el instalador."
+    exit 1
+  fi
+  echo "Preparando el runtime local Needle para Apple Silicon..."
+  NEEDLE_TELEMETRY=0 DO_NOT_TRACK=1 "$NEEDLE_CLI" fetch
+  echo "Verificando la carga local de Cactus Whistle..."
+  NEEDLE_TELEMETRY=0 DO_NOT_TRACK=1 "$VENV_PYTHON" -c "from transcription_engines import WhistleTranscriber; engine = WhistleTranscriber(language='es'); engine.close(); print('Cactus Whistle listo.')"
+else
+  echo "Mac Intel detectado: se usará Whisper Small; se omite Needle y Whistle."
+fi
+
+echo "Descargando y verificando Whisper de respaldo (Small por defecto)..."
+"$VENV_PYTHON" -c "from dotenv import load_dotenv; import os; from faster_whisper import WhisperModel; load_dotenv('.env', override=True); name = os.getenv('WHISPER_MODEL', '').strip() or 'small'; print(f'Respaldo Whisper: {name}'); WhisperModel(name, device='cpu', compute_type='int8'); print('Respaldo listo.')"
 
 echo "Preparando el capturador nativo de audio del sistema..."
 "$PROJECT_DIR/macos/build_audio_capture.sh"

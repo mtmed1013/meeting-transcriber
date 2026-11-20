@@ -1,0 +1,27 @@
+[package]
+name = "meeting-transcriber-desktop"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+tauri = { version = "2.2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+mt-core = { path = "../../crates/mt-core" }
+mt-models = { path = "../../crates/mt-models" }
+mt-ai = { path = "../../crates/mt-ai" }
+
+[build-dependencies]
+tauri-build = { version = "2.2", features = [] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.20"
+objc2-app-kit = { version = "0.3", features = ["NSControl", "NSMenu", "NSStatusBarButton", "NSStatusItem", "NSView"] }
+objc2-foundation = { version = "0.3", features = ["NSArray"] }

@@ -1,0 +1,11 @@
+{
+  "bundle": {
+    "resources": {
+      "../../meeting_transcriber.py": "meeting_transcriber.py",
+      "../../transcription_engines.py": "transcription_engines.py",
+      "../../windows_audio.py": "windows_audio.py",
+      "../../requirements.txt": "requirements.txt",
+      "../../macos/.build/MeetingTranscriberAudio.app": "macos/.build/MeetingTranscriberAudio.app"
+    }
+  }
+}

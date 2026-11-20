@@ -1,5 +1,6 @@
 faster-whisper==1.2.1
 cactus-needle==3.1.0; sys_platform == "win32" and platform_machine == "AMD64"
+cactus-needle==3.1.0; sys_platform == "darwin" and (platform_machine == "arm64" or platform_machine == "aarch64")
 librosa==0.11.0
 numpy>=2.0,<3
 python-dotenv>=1.0,<2

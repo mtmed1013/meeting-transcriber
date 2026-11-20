@@ -1,0 +1,79 @@
+name: Windows installers
+
+# Builds the Windows MSI and NSIS installers on a real Windows runner.
+# Cross-compiling Tauri bundles from macOS is not supported, so this is the supported path:
+#   git push  ->  Actions  ->  "Windows installers"  ->  download the artifacts.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+      - "feat/**"
+
+jobs:
+  build:
+    name: Build MSI and NSIS
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: app/src-tauri
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build the app and its installers
+        # WiX (MSI) and NSIS are downloaded by Tauri on first use.
+        run: cargo tauri build --bundles msi,nsis --target x86_64-pc-windows-msvc
+
+      - name: List the installers
+        if: always()
+        working-directory: .
+        run: |
+          Get-ChildItem -Recurse -Path target/x86_64-pc-windows-msvc/release/bundle -Include *.msi,*.exe |
+            Select-Object FullName, Length | Format-Table -AutoSize
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: meeting-transcriber-windows
+          if-no-files-found: error
+          path: |
+            target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+
+  test:
+    name: Rust tests
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace

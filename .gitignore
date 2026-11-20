@@ -20,3 +20,7 @@ outputs/
 .env
 .env.*
 !.env.example
+
+# Rust / Tauri build output
+/target/
+app/src-tauri/gen/

@@ -1,0 +1,17 @@
+[package]
+name = "mt-ai"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+mt-core = { path = "../mt-core" }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tempfile = { workspace = true }

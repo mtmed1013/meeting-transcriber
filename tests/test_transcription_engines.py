@@ -24,21 +24,21 @@ class TranscriptionEngineTests(unittest.TestCase):
         )
         self.assertEqual(
             engines.resolve_engine("auto", system="Darwin", machine="arm64"),
-            "whisper",
+            "whistle",
         )
         self.assertEqual(
             engines.resolve_engine("auto", system="Darwin", machine="x86_64"),
             "whisper",
         )
 
-    def test_removed_engines_are_rejected_and_whistle_is_windows_only(self):
-        with self.assertRaisesRegex(RuntimeError, "Windows x64"):
-            engines.resolve_engine("whistle", system="Darwin", machine="arm64")
+    def test_removed_engines_are_rejected_and_whistle_requires_supported_architecture(self):
+        with self.assertRaisesRegex(RuntimeError, "Windows x64 y macOS Apple Silicon"):
+            engines.resolve_engine("whistle", system="Darwin", machine="x86_64")
         for removed_engine in ("canary", "nemotron"):
             with self.subTest(engine=removed_engine), self.assertRaises(ValueError):
                 engines.resolve_engine(removed_engine, system="Darwin", machine="arm64")
 
-    def test_factory_uses_whistle_on_windows_and_medium_whisper_on_macos(self):
+    def test_factory_uses_whistle_on_windows_and_macos_and_small_whisper_on_intel(self):
         with patch.object(engines, "WhistleTranscriber", return_value="whistle") as whistle:
             self.assertEqual(
                 engines.create_transcriber(
@@ -48,15 +48,24 @@ class TranscriptionEngineTests(unittest.TestCase):
             )
             whistle.assert_called_once_with(language="es")
 
-        with patch.object(engines, "WhisperTranscriber", return_value="whisper") as whisper:
+        with patch.object(engines, "WhistleTranscriber", return_value="whistle") as whistle:
             self.assertEqual(
                 engines.create_transcriber(
                     "auto", system="Darwin", machine="arm64"
                 ),
+                "whistle",
+            )
+            whistle.assert_called_once_with(language="es")
+
+        with patch.object(engines, "WhisperTranscriber", return_value="whisper") as whisper:
+            self.assertEqual(
+                engines.create_transcriber(
+                    "auto", system="Darwin", machine="x86_64"
+                ),
                 "whisper",
             )
             whisper.assert_called_once_with(
-                "medium", language="es", vad_filter=True, beam_size=5, windows=False,
+                "small", language="es", vad_filter=True, beam_size=5, windows=False,
             )
 
         with patch.object(engines, "WhisperTranscriber", return_value="whisper") as whisper:
@@ -72,6 +81,31 @@ class TranscriptionEngineTests(unittest.TestCase):
             whisper.assert_called_once_with(
                 "small", language="es", vad_filter=True, beam_size=5, windows=True,
             )
+
+    def test_macos_auto_falls_back_to_small_only_when_whistle_fails_to_load(self):
+        with patch.object(
+            engines, "WhistleTranscriber", side_effect=RuntimeError("runtime unavailable")
+        ), patch.object(engines, "WhisperTranscriber", return_value="whisper") as whisper:
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                result = engines.create_transcriber(
+                    "auto", system="Darwin", machine="arm64"
+                )
+
+        self.assertEqual(result, "whisper")
+        whisper.assert_called_once_with(
+            "small", language="es", vad_filter=True, beam_size=5, windows=False,
+        )
+        self.assertIn("Intentando respaldo Whisper small", output.getvalue())
+
+    def test_explicit_whistle_does_not_silently_fall_back(self):
+        with patch.object(
+            engines, "WhistleTranscriber", side_effect=RuntimeError("runtime unavailable")
+        ), patch.object(engines, "WhisperTranscriber") as whisper:
+            with self.assertRaisesRegex(RuntimeError, "runtime unavailable"):
+                engines.create_transcriber(
+                    "whistle", system="Darwin", machine="arm64"
+                )
+        whisper.assert_not_called()
 
     def test_whistle_uses_local_weights_and_disables_network_telemetry(self):
         calls = {}
@@ -122,7 +156,7 @@ class TranscriptionEngineTests(unittest.TestCase):
         fake_faster_whisper = types.SimpleNamespace(WhisperModel=FakeWhisperModel)
         with patch.dict(sys.modules, {"faster_whisper": fake_faster_whisper}):
             engine = engines.WhisperTranscriber(
-                "medium",
+                "small",
                 language="es",
                 vad_filter=True,
                 beam_size=5,
@@ -131,7 +165,7 @@ class TranscriptionEngineTests(unittest.TestCase):
             text = engine.transcribe(np.ones(5, dtype=np.float32))
 
         self.assertEqual(text, "texto")
-        self.assertEqual(calls["model_name"], "medium")
+        self.assertEqual(calls["model_name"], "small")
         self.assertEqual(calls["model_options"]["compute_type"], "int8")
         self.assertNotIn("cpu_threads", calls["model_options"])
         self.assertEqual(calls["transcribe_options"]["language"], "es")
@@ -159,7 +193,7 @@ class TranscriptionEngineTests(unittest.TestCase):
             "audio_queue": audio_queue,
             "SAMPLE_RATE": 10,
             "BLOCK_SECONDS": 1,
-            "transcriber": types.SimpleNamespace(name="Whisper medium"),
+            "transcriber": types.SimpleNamespace(name="Whisper small"),
             "flush_buffer": lambda chunks, path: flushed.append(
                 sum(len(chunk) for chunk in chunks)
             ),

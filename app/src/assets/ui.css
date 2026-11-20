@@ -1,0 +1,494 @@
+/*
+ * Meeting Transcriber UI kit — the single source of styles for every window (settings, session).
+ * No build step and no network: plain CSS served from app/src, so it works offline.
+ * Adapted from the Teo UI kit (teo/app/src/assets/teo-ui.css) with the same token and class architecture.
+ *
+ * Use it:   <link rel="stylesheet" href="assets/ui.css">
+ * Rule:     never restyle a control inside a page. Use a component below; if none fits, add one
+ *           here so every window gets it. Pages carry no page-specific inline styles.
+ *
+ * Theme:    dark by default, light when the system is light (prefers-color-scheme). A window can
+ *           force one with <html data-theme="dark|light">. Colours are tokens (--ui-*): do not
+ *           hard-code hex values outside the :root token blocks below.
+ *
+ * Layout:
+ *   .settings-shell     Grid: drag strip · sidebar nav (.settings-nav) · main (.settings-main) · footer.
+ *     .nav-item         Sidebar entry. Mark the active one with .is-active or aria-current="page".
+ *     .tab-panel        One panel per nav item; toggle with the [hidden] attribute.
+ *   .session-shell      Column: header (drag region) · main (scrolls) · footer.
+ *   .drag-strip         Titlebar drag area for overlay title bars.
+ *
+ * Components (one size, one radius, one focus ring):
+ *   .ui-card            Group of rows with hairline dividers (macOS Settings style).
+ *   .ui-row             Label + hint on the left, control on the right.
+ *     .ui-row--stack    Control below the label, full width (long text, sliders).
+ *   .ui-text            Label + hint block inside a row.
+ *   .ui-label / .ui-hint / .ui-section-title
+ *   .ui-stack / .ui-actions   Vertical stack / wrapping button or control group.
+ *   .ui-select          Dropdown. Always --ui-control-w wide, so lists never differ in size.
+ *   .ui-input           Text/number/password field (same width as .ui-select).
+ *     .ui-input--num    Narrow numeric field.
+ *   .ui-textarea        Multi-line message box.
+ *     .ui-textarea--tall  Taller monospace box for multi-line instructions (skill prompts).
+ *   .ui-switch          Toggle for on/off options: <label class="ui-switch"><input type="checkbox" role="switch"><span></span></label>
+ *   .ui-switch-label    Switch with visible text: <label class="ui-switch-label"><span class="ui-switch"><input type="checkbox" role="switch"><span></span></span>Texto</label>
+ *   .ui-segmented       2-4 mutually exclusive choices: radios inside labels.
+ *   .ui-range           Slider.
+ *   .ui-btn             Button. Variants: --primary, --danger, --quiet, --soft (flat tinted),
+ *                       --inverse (light on dark), --icon (square), --compact (28px, for dense bars).
+ *   .ui-status          Inline message. Variants: --ok, --warn, --error.
+ *   .ui-badge           Small pill. Variants: --ok, --warn, --error.
+ *   .ui-progress        Progress bar (set the child's width).
+ *     .ui-progress--indeterminate  Unknown length: the child slides instead of showing a width (clear its width).
+ *   .ui-notice          Calm, low-emphasis banner (legal/consent). Use <details class="ui-notice">
+ *                       with .ui-notice__summary and .ui-notice__details, or a plain div.
+ *   .ui-rule-list       Table-like list of correction rules; each row is .ui-rule-row
+ *                       (.ui-rule-row--head for the column header row).
+ *
+ * Rule of thumb: on/off → switch · one of 2–4 → segmented · one of many → select · number → input.
+ */
+
+/* ---------- Tokens ----------
+ * Dark is the default. The light palette applies when the system is light (unless the page forces
+ * dark) or when <html data-theme="light"> is set. The explicit dark block lets a light system be
+ * overridden to dark with data-theme="dark". */
+:root {
+  --ui-bg: #141518;
+  --ui-surface: #1d1e27;
+  --ui-surface-2: #292a35;
+  --ui-border: #33344a;
+  --ui-text: #f4f4f7;
+  --ui-text-muted: #a4a5b1;
+  --ui-accent: #897bf2;
+  --ui-accent-hover: #9b8df9;
+  --ui-accent-text: #ffffff;
+  --ui-ok: #30d158;
+  --ui-warn: #f5a623;
+  --ui-danger: #ff6b6b;
+  --ui-selected: #3a3560;
+  --ui-shadow: 0 1px 2px rgba(0, 0, 0, .35);
+  --ui-knob: #ffffff;
+
+  --ui-ease-out: cubic-bezier(0.23, 1, 0.32, 1); /* entrances and exits */
+  --ui-radius: 10px;
+  --ui-radius-lg: 14px;
+  --ui-control-h: 32px;
+  --ui-control-w: 220px;
+  --ui-gap: 12px;
+  --ui-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --ui-font-size: 13px;
+  --ui-font-small: 11.5px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --ui-bg: #f5f5f8;
+    --ui-surface: #ffffff;
+    --ui-surface-2: #eceef3;
+    --ui-border: #dcdde6;
+    --ui-text: #1b1c22;
+    --ui-text-muted: #6a6c7a;
+    --ui-accent: #6f5ee6;
+    --ui-accent-hover: #5d4bd6;
+    --ui-accent-text: #ffffff;
+    --ui-ok: #1f9d46;
+    --ui-warn: #b86e00;
+    --ui-danger: #d63a3a;
+    --ui-selected: #e3dffc;
+    --ui-shadow: 0 1px 2px rgba(20, 20, 40, .12);
+  }
+}
+:root[data-theme="light"] {
+  --ui-bg: #f5f5f8;
+  --ui-surface: #ffffff;
+  --ui-surface-2: #eceef3;
+  --ui-border: #dcdde6;
+  --ui-text: #1b1c22;
+  --ui-text-muted: #6a6c7a;
+  --ui-accent: #6f5ee6;
+  --ui-accent-hover: #5d4bd6;
+  --ui-accent-text: #ffffff;
+  --ui-ok: #1f9d46;
+  --ui-warn: #b86e00;
+  --ui-danger: #d63a3a;
+  --ui-selected: #e3dffc;
+  --ui-shadow: 0 1px 2px rgba(20, 20, 40, .12);
+}
+:root[data-theme="dark"] {
+  --ui-bg: #141518;
+  --ui-surface: #1d1e27;
+  --ui-surface-2: #292a35;
+  --ui-border: #33344a;
+  --ui-text: #f4f4f7;
+  --ui-text-muted: #a4a5b1;
+  --ui-accent: #897bf2;
+  --ui-accent-hover: #9b8df9;
+  --ui-accent-text: #ffffff;
+  --ui-ok: #30d158;
+  --ui-warn: #f5a623;
+  --ui-danger: #ff6b6b;
+  --ui-selected: #3a3560;
+  --ui-shadow: 0 1px 2px rgba(0, 0, 0, .35);
+}
+
+:root { color-scheme: dark light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+:root[data-theme="light"] { color-scheme: light; }
+
+/* ---------- Base ---------- */
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body {
+  height: 100%;
+  margin: 0;
+  background: var(--ui-bg);
+  color: var(--ui-text);
+  font-family: var(--ui-font);
+  font-size: var(--ui-font-size);
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- Window layouts ---------- */
+.settings-shell {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "drag drag"
+    "nav main"
+    "footer footer";
+  height: 100vh;
+  min-height: 0;
+  background: var(--ui-bg);
+}
+.drag-strip { grid-area: drag; height: 28px; -webkit-app-region: drag; user-select: none; }
+.settings-nav {
+  grid-area: nav;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+  padding: 8px;
+  overflow-y: auto;
+  background: var(--ui-surface);
+  border-right: 1px solid var(--ui-border);
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 30px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: var(--ui-font-size);
+  text-align: left;
+  color: var(--ui-text);
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background-color .15s var(--ui-ease-out);
+}
+.nav-item:hover { background: var(--ui-surface-2); }
+.nav-item:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 1px; }
+.nav-item.is-active, .nav-item[aria-current="page"] { background: var(--ui-selected); font-weight: 600; }
+.nav-item svg { flex: none; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.settings-main {
+  grid-area: main;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ui-gap);
+  min-width: 0;
+  min-height: 0;
+  padding: 16px 20px;
+  overflow-y: auto;
+}
+.tab-panel { display: flex; flex-direction: column; gap: var(--ui-gap); min-width: 0; }
+.settings-footer {
+  grid-area: footer;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-height: 52px;
+  padding: 10px 16px;
+  background: var(--ui-surface);
+  border-top: 1px solid var(--ui-border);
+}
+.settings-footer > .ui-status { flex: 1; min-width: 0; }
+
+.session-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-height: 0;
+  background: var(--ui-bg);
+}
+.session-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 8px 12px;
+  -webkit-app-region: drag;
+  user-select: none;
+  border-bottom: 1px solid var(--ui-border);
+}
+.session-header :where(button, a, input, select, textarea, label) { -webkit-app-region: no-drag; }
+.session-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  padding: 12px;
+  overflow-y: auto;
+}
+.session-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--ui-border);
+  background: var(--ui-surface);
+}
+.session-footer > .ui-status { flex: 1; min-width: 0; }
+
+/* ---------- Layout primitives ---------- */
+.ui-card {
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-lg);
+  box-shadow: var(--ui-shadow);
+}
+.ui-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 48px;
+  padding: 10px 14px;
+}
+.ui-row + .ui-row { border-top: 1px solid var(--ui-border); }
+.ui-row--stack { flex-direction: column; align-items: stretch; gap: 8px; }
+.ui-text { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.ui-label { font-size: var(--ui-font-size); color: var(--ui-text); font-weight: 500; }
+.ui-hint { font-size: var(--ui-font-small); line-height: 1.4; color: var(--ui-text-muted); }
+.ui-section-title { margin: 8px 4px -4px; font-size: var(--ui-font-small); font-weight: 600; letter-spacing: .02em; text-transform: uppercase; color: var(--ui-text-muted); }
+.ui-stack { display: flex; flex-direction: column; gap: var(--ui-gap); min-width: 0; }
+.ui-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+/* ---------- Fields ---------- */
+.ui-select, .ui-input {
+  width: var(--ui-control-w);
+  max-width: 100%;
+  height: var(--ui-control-h);
+  padding: 0 10px;
+  font: inherit;
+  font-size: var(--ui-font-size);
+  color: var(--ui-text);
+  background: var(--ui-surface-2);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius);
+  outline: none;
+}
+.ui-input::placeholder { color: var(--ui-text-muted); }
+.ui-input--num { width: 96px; text-align: right; font-variant-numeric: tabular-nums; }
+.ui-row--stack .ui-select, .ui-row--stack .ui-input:not(.ui-input--num) { width: 100%; }
+.ui-select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 30px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  /* Chevron drawn with two token-coloured gradients (no hex, no data-URI colour). */
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--ui-text-muted) 50%),
+    linear-gradient(135deg, var(--ui-text-muted) 50%, transparent 50%);
+  background-repeat: no-repeat;
+  background-position: calc(100% - 14px) 50%, calc(100% - 8px) 50%;
+  background-size: 6px 6px, 6px 6px;
+}
+.ui-select:focus-visible, .ui-input:focus-visible { border-color: var(--ui-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-accent) 30%, transparent); }
+.ui-select:disabled, .ui-input:disabled { opacity: .5; cursor: default; }
+
+.ui-textarea {
+  display: block; width: 100%; min-width: 0; min-height: 40px; max-height: 120px; padding: 10px 12px;
+  resize: none; font: inherit; font-size: var(--ui-font-size); line-height: 1.4; color: var(--ui-text);
+  background: var(--ui-surface-2); border: 0; border-radius: 13px; outline: none;
+}
+.ui-textarea::placeholder { color: var(--ui-text-muted); }
+.ui-textarea:focus-visible { box-shadow: 0 0 0 2px var(--ui-accent); }
+.ui-textarea--tall {
+  min-height: 180px; max-height: 340px; resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.45;
+  border: 1px solid var(--ui-border);
+}
+
+/* ---------- Switch ---------- */
+.ui-switch { position: relative; display: inline-block; flex: none; width: 38px; height: 22px; cursor: pointer; }
+.ui-switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.ui-switch span { position: absolute; inset: 0; border-radius: 999px; background: var(--ui-surface-2); border: 1px solid var(--ui-border); transition: background-color .15s var(--ui-ease-out), border-color .15s var(--ui-ease-out); pointer-events: none; }
+.ui-switch span::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--ui-knob); box-shadow: 0 1px 2px rgba(0, 0, 0, .35); transition: transform .15s var(--ui-ease-out); }
+.ui-switch input:checked + span { background: var(--ui-accent); border-color: var(--ui-accent); }
+.ui-switch input:checked + span::after { transform: translateX(16px); }
+.ui-switch input:focus-visible + span { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-accent) 35%, transparent); }
+.ui-switch input:disabled, .ui-switch input:disabled + span { opacity: .5; cursor: default; }
+.ui-switch-label {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: var(--ui-font-small); color: var(--ui-text-muted); white-space: nowrap; cursor: pointer;
+}
+
+/* ---------- Segmented ---------- */
+.ui-segmented { display: inline-flex; padding: 2px; gap: 2px; background: var(--ui-surface-2); border: 1px solid var(--ui-border); border-radius: var(--ui-radius); }
+.ui-segmented label { position: relative; display: inline-flex; align-items: center; justify-content: center; min-width: 84px; height: calc(var(--ui-control-h) - 6px); padding: 0 12px; border-radius: 8px; font-size: var(--ui-font-size); color: var(--ui-text-muted); cursor: pointer; }
+.ui-segmented input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.ui-segmented label:has(input:checked) { background: var(--ui-selected); color: var(--ui-text); font-weight: 600; }
+.ui-segmented label:has(input:focus-visible) { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-accent) 35%, transparent); }
+
+/* ---------- Range ---------- */
+.ui-range { width: 100%; height: 20px; margin: 0; accent-color: var(--ui-accent); cursor: pointer; }
+
+/* ---------- Buttons ---------- */
+.ui-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: var(--ui-control-h); padding: 0 14px;
+  font: inherit; font-size: var(--ui-font-size); font-weight: 500; white-space: nowrap;
+  color: var(--ui-text); background: var(--ui-surface-2);
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  cursor: pointer;
+  transition: background-color .15s var(--ui-ease-out), border-color .15s var(--ui-ease-out);
+}
+.ui-btn:hover { border-color: var(--ui-accent); }
+.ui-btn:active { transform: translateY(1px); }
+.ui-btn:disabled { opacity: .5; cursor: default; transform: none; }
+.ui-btn:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 2px; }
+.ui-btn--primary { background: var(--ui-accent); border-color: var(--ui-accent); color: var(--ui-accent-text); font-weight: 600; }
+.ui-btn--primary:hover { background: var(--ui-accent-hover); border-color: var(--ui-accent-hover); }
+.ui-btn--danger { color: var(--ui-danger); border-color: color-mix(in srgb, var(--ui-danger) 45%, var(--ui-border)); }
+.ui-btn--danger:hover { border-color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 12%, var(--ui-surface-2)); }
+.ui-btn--quiet { background: transparent; }
+.ui-btn--soft { background: var(--ui-surface-2); border-color: transparent; }
+.ui-btn--soft:hover { background: color-mix(in srgb, var(--ui-text) 14%, var(--ui-surface-2)); border-color: transparent; }
+.ui-btn--inverse { background: var(--ui-text); border-color: var(--ui-text); color: var(--ui-bg); }
+.ui-btn--inverse:hover { border-color: var(--ui-text); opacity: .9; }
+.ui-btn--icon { width: var(--ui-control-h); padding: 0; }
+.ui-btn--compact { height: 28px; min-width: 32px; padding: 0 8px; border-radius: 12px; }
+.ui-btn--icon.ui-btn--compact { width: 32px; padding: 0; }
+.ui-btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+
+/* ---------- Status, badges, progress ---------- */
+.ui-status { font-size: var(--ui-font-small); line-height: 1.4; color: var(--ui-text-muted); overflow-wrap: anywhere; }
+.ui-status:empty { display: none; }
+.ui-status--ok { color: var(--ui-ok); }
+.ui-status--warn { color: var(--ui-warn); }
+.ui-status--error { color: var(--ui-danger); }
+
+.ui-badge {
+  display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 8px;
+  font-size: 11px; font-weight: 600; line-height: 1; white-space: nowrap;
+  color: var(--ui-text-muted); background: var(--ui-surface-2);
+  border: 1px solid var(--ui-border); border-radius: 999px;
+}
+.ui-badge--ok { color: var(--ui-ok); background: color-mix(in srgb, var(--ui-ok) 16%, transparent); border-color: transparent; }
+.ui-badge--warn { color: var(--ui-warn); background: color-mix(in srgb, var(--ui-warn) 16%, transparent); border-color: transparent; }
+.ui-badge--error { color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 16%, transparent); border-color: transparent; }
+
+.ui-progress { height: 6px; overflow: hidden; border-radius: 3px; background: var(--ui-surface-2); }
+.ui-progress > div { height: 100%; width: 0; background: var(--ui-accent); transition: width .2s var(--ui-ease-out); }
+/* Indeterminate: a 35% bar slides across the track while the length of the task is unknown. */
+.ui-progress--indeterminate > div { width: 35%; transition: none; animation: ui-progress-slide 1.4s var(--ui-ease-out) infinite; }
+@keyframes ui-progress-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(286%); } /* 286% of a 35% bar = 100% of the track, so it leaves on both sides */
+}
+
+/* ---------- Notice (calm legal/consent banner) ---------- */
+.ui-notice {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  font-size: var(--ui-font-small);
+  line-height: 1.45;
+  color: var(--ui-text-muted);
+  background: var(--ui-surface-2);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius);
+}
+.ui-notice__summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--ui-text);
+  cursor: pointer;
+  list-style: none;
+}
+.ui-notice__summary::-webkit-details-marker { display: none; }
+.ui-notice__summary::before {
+  content: "";
+  flex: none;
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid currentColor;
+  transition: transform .15s var(--ui-ease-out);
+}
+.ui-notice[open] > .ui-notice__summary::before { transform: rotate(90deg); }
+.ui-notice__summary:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 2px; border-radius: 4px; }
+.ui-notice__details { margin: 0; padding-top: 4px; }
+
+/* ---------- Rules table (deterministic correction rules) ---------- */
+.ui-rule-list {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-lg);
+}
+.ui-rule-row {
+  display: grid;
+  /* Two flexible text columns; the options column keeps its natural width so its switch labels never wrap. */
+  grid-template-columns: minmax(120px, 1fr) minmax(120px, 1fr) max-content;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 8px 12px;
+}
+.ui-rule-row + .ui-rule-row { border-top: 1px solid var(--ui-border); }
+.ui-rule-row .ui-input, .ui-rule-row .ui-select { width: 100%; min-width: 0; }
+.ui-rule-row > .ui-actions { flex-wrap: nowrap; gap: 12px; }
+.ui-section-title + .ui-hint { margin: 4px 4px 6px; }
+.ui-rule-row--head {
+  min-height: 0;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  font-size: var(--ui-font-small);
+  font-weight: 600;
+  color: var(--ui-text-muted);
+  background: var(--ui-surface-2);
+}
+
+/* ---------- Sesión tab (layout for the live session card inside .settings-main) ---------- */
+.session-hero { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.session-hero h2 { margin: 0; min-width: 0; font-size: 20px; font-weight: 600; }
+.session-hero .ui-btn { margin-left: auto; white-space: nowrap; }
+.session-timer { font-size: 28px; font-weight: 600; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.session-stats { text-align: right; justify-items: end; }
+.session-value { min-width: 0; text-align: right; overflow-wrap: anywhere; }
+.session-notice ol { margin: 6px 0 0; padding-left: 18px; }
+.session-notice .ui-notice__details[open] > .ui-notice__summary::before { transform: rotate(90deg); }
+
+/* ---------- Motion ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .ui-switch span, .ui-switch span::after, .ui-btn, .nav-item,
+  .ui-progress > div, .ui-notice__summary::before { transition: none; }
+  .ui-progress--indeterminate > div { animation: none; transform: none; width: 50%; }
+}

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Meeting Transcriber",
+  "identifier": "com.meetingtranscriber.app",
+  "build": {
+    "frontendDist": "../src"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Meeting Transcriber",
+        "url": "index.html",
+        "visible": true,
+        "alwaysOnTop": false,
+        "minimizable": true,
+        "resizable": true,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "width": 860,
+        "height": 640,
+        "minWidth": 680,
+        "minHeight": 520,
+        "center": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": {
+      "../../meeting_transcriber.py": "meeting_transcriber.py",
+      "../../transcription_engines.py": "transcription_engines.py",
+      "../../windows_audio.py": "windows_audio.py",
+      "../../requirements.txt": "requirements.txt"
+    },
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "signingIdentity": "-",
+      "entitlements": "Entitlements.plist"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Meeting Transcriber necesita acceso al micrófono para transcribir tus reuniones.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Meeting Transcriber necesita capturar el audio del sistema para transcribir las reuniones.</string>
+</dict>
+</plist>

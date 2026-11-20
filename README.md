@@ -9,11 +9,14 @@ Transcripción local de reuniones y guardado de notas en Obsidian.
 | Plataforma | Motor predeterminado |
 | --- | --- |
 | Windows x64 | Cactus Whistle mediante Needle CPU (Whisper Small como respaldo) |
-| macOS (Apple Silicon e Intel) | Whisper Medium |
+| macOS Apple Silicon | Cactus Whistle mediante Needle CPU (Whisper Small como respaldo) |
+| macOS Intel | Whisper Small |
 
 Define `TRANSCRIPTION_ENGINE=whisper` para usar Faster-Whisper en cualquiera
-de las dos plataformas, o `whistle` en Windows x64. Un motor
-incompatible falla con un mensaje; no hay cambio de motor durante una reunión.
+de las dos plataformas, o `whistle` en Windows x64 y macOS Apple Silicon. En
+macOS Apple Silicon, `auto` cambia a Whisper Small antes de iniciar la captura
+si Whistle no puede cargarse; muestra una advertencia. No cambia de motor
+durante una reunión. Un motor incompatible falla con un mensaje.
 
 `TRANSCRIPTION_LANGUAGE=es` fija español. Whistle también admite `auto`.
 Whisper conserva sus opciones actuales de VAD y beam size. Por compatibilidad,
@@ -21,15 +24,16 @@ si falta `TRANSCRIPTION_LANGUAGE`, se sigue leyendo `WHISPER_LANGUAGE` de
 instalaciones anteriores.
 
 Whistle usa únicamente `whistle.cact` mediante Needle CPU; no descarga
-`needle3.cact`. Whisper se ejecuta localmente y el instalador prepara el modelo
-seleccionado antes de iniciar la aplicación. El audio de las reuniones nunca se
-envía a un servicio externo.
+`needle3.cact`. En macOS Apple Silicon se prepara el runtime nativo de Needle y
+el modelo durante la instalación. Whisper Small también queda listo como
+respaldo. Ambos motores se ejecutan localmente; el audio de las reuniones nunca
+se envía a un servicio externo.
 
-En macOS, Whisper transcribe bloques de 30 segundos y guarda cada resultado en
-la nota de Obsidian. El audio se mantiene en memoria; no se crean WAV temporales.
-Al detener con `Ctrl+C`, se procesa también el bloque parcial pendiente. Como
-con cualquier captura sin persistencia de audio, un cierre inesperado puede
-perder el bloque que todavía no alcanzó a transcribirse.
+En macOS, el motor seleccionado transcribe bloques de 30 segundos y guarda cada
+resultado en la nota de Obsidian. El audio se mantiene en memoria; no se crean
+WAV temporales. Al detener con `Ctrl+C`, se procesa también el bloque parcial
+pendiente. Como con cualquier captura sin persistencia de audio, un cierre
+inesperado puede perder el bloque que todavía no alcanzó a transcribirse.
 
 ## Instalación en macOS
 
@@ -40,9 +44,11 @@ instalador:
   Apple y espera a que termine;
 - crea el entorno virtual e instala las dependencias;
 - crea `.env` solo si todavía no existe;
-- migra `TRANSCRIPTION_ENGINE=canary` o `nemotron` a `whisper` en un `.env`
-  existente;
-- descarga y verifica Whisper Medium (o el modelo configurado en `WHISPER_MODEL`);
+- migra motores antiguos Canary/Nemotron a `auto` y `WHISPER_MODEL=medium` a
+  `small` en un `.env` existente, conservando la ruta y demás valores;
+- en Apple Silicon descarga y verifica `whistle.cact`, prepara Needle y prueba
+  que Whistle cargue localmente;
+- descarga y prepara Whisper Small como respaldo local;
 - elimina del directorio local `models/` los pesos/temporales antiguos de
   Canary y Nemotron;
 - compila el capturador nativo de audio del sistema;
@@ -78,12 +84,14 @@ Ejemplo:
 OBSIDIAN_DIR=/Users/TU_USUARIO/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian
 TRANSCRIPTION_ENGINE=auto
 TRANSCRIPTION_LANGUAGE=es
-WHISPER_MODEL=medium
+WHISPER_MODEL=small
 ```
 
-`WHISPER_MODEL` configura Faster-Whisper y puede ser `medium`, `small` o `tiny`;
-`medium` es el predeterminado en macOS. El instalador conserva un `.env`
-existente y descarga el modelo que allí esté configurado.
+`WHISPER_MODEL` configura Whisper en macOS; Windows usa
+`WINDOWS_WHISPER_MODEL`. Ambos usan `small` por defecto como respaldo. En Mac
+`tiny` también puede configurarse si se prefiere reducir aún más el tamaño frente
+a la precisión. El instalador conserva la ruta de Obsidian y los demás valores
+del `.env`; migra `medium` a `small`.
 
 Para preparar también el motor y sus pesos locales, ejecuta una vez
 `install_macos.command`. Instalar solo las dependencias con `pip` no descarga
@@ -113,6 +121,12 @@ durante la reunión pueden entrar en la transcripción. El mezclador conserva
 audio de una fuente aunque la otra tenga un retraso breve y registra los huecos
 que deba rellenar.
 
+Los paquetes nativos se alinean con su marca de presentación de CoreMedia,
+no con la hora de llegada del callback: macOS puede entregarlos en ráfagas.
+Usar la hora de llegada superpondría paquetes y recortaría el audio del sistema.
+Tras actualizar el capturador, detén y vuelve a iniciar la transcripción; una
+sesión abierta continúa usando el binario anterior.
+
 La captura nativa necesita Xcode Command Line Tools. Si no usas el instalador,
 puedes iniciar su instalación manualmente con:
 
@@ -120,15 +134,19 @@ puedes iniciar su instalación manualmente con:
 xcode-select --install
 ```
 
-En macOS, el audio combinado se entrega a la cola en memoria y Whisper procesa
-bloques de ~30 segundos. Cada bloque reconocido se escribe en la nota antes de
-continuar; no se generan archivos WAV en disco. `Ctrl+C` detiene la captura y
-hace que macOS transcriba el último bloque parcial antes de cerrar la nota.
+En macOS, el audio combinado se entrega a la cola en memoria y el motor activo
+procesa bloques de ~30 segundos. Cada bloque reconocido se escribe en la nota
+antes de continuar; no se generan archivos WAV en disco. `Ctrl+C` detiene la
+captura y hace que macOS transcriba el último bloque parcial antes de cerrar la
+nota.
 
 El capturador nativo se ejecuta en una sesión separada para que `Ctrl+C` llegue
-primero al proceso principal. Así Python puede guardar la última transcripción y
-cerrar el capturador de forma ordenada, sin reportar como error el código `-2`
-que corresponde a una interrupción voluntaria.
+primero al proceso principal. Python detiene primero la entrada de audio y
+consume los paquetes ya recibidos, incluido el último fragmento menor de 20 ms,
+antes de transcribir el bloque pendiente. Durante el cierre muestra el progreso;
+una segunda pulsación acelera el cierre del helper y conserva el audio que ya
+está en memoria. No se reporta como error el código `-2` que corresponde a una
+interrupción voluntaria.
 
 La primera ejecución también puede solicitar permisos separados para `Grabación
 de pantalla y audio del sistema` y `Micrófono`, porque el capturador nativo es
@@ -138,10 +156,11 @@ un helper independiente. Si el VAD omite voces muy bajas, puedes probar
 sin modificar el volumen audible del equipo.
 
 Si `.env` de una instalación previa declara Canary o Nemotron como motor, el
-instalador lo migra a `whisper` y conserva las demás variables. También limpia
-los artefactos locales conocidos de esos dos modelos. El modelo Whistle se
-publica con licencia Apache-2.0; revisa las licencias de modelos y runtimes
-antes de redistribuirlos.
+instalador lo migra a `auto` y conserva las demás variables. También cambia
+Whisper Medium a Small para el respaldo, limpia los artefactos locales
+conocidos de Canary/Nemotron y no borra la caché compartida de otros programas.
+El modelo Whistle se publica con licencia Apache-2.0; revisa las licencias de
+modelos y runtimes antes de redistribuirlos.
 
 Si no defines `OBSIDIAN_DIR`, macOS usa la ruta de iCloud de Obsidian y Windows
 usa `~/Documents/Obsidian`.
@@ -170,7 +189,7 @@ necesitas seleccionar dispositivos concretos, usa
 
 Windows usa Whistle como motor predeterminado y `WINDOWS_WHISPER_MODEL=small`
 como respaldo. Define `TRANSCRIPTION_ENGINE=whisper` para usar ese respaldo;
-puedes seleccionar `medium` o `tiny` con `WINDOWS_WHISPER_MODEL`. La variable
+puedes seleccionar otro tamaño con `WINDOWS_WHISPER_MODEL`. La variable
 Windows tiene prioridad sobre `WHISPER_MODEL`. El instalador conserva un `.env`
 existente y descarga el Whisper Windows seleccionado. El archivo
 `needle3.cact` no se usa ni se descarga.

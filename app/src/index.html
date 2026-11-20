@@ -1,0 +1,1711 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Meeting Transcriber</title>
+    <link rel="stylesheet" href="assets/ui.css" />
+    <style>
+      /* Page layout only. Every control comes from assets/ui.css: do not restyle controls here. */
+      body { overflow: hidden; }
+      .settings-nav h1 { margin: 0 0 8px; padding: 0 10px; font-size: var(--ui-font-small); font-weight: 600; color: var(--ui-text-muted); }
+      .settings-main h2 { margin: 0; font-size: 20px; font-weight: 600; }
+      .settings-main fieldset { display: flex; flex-direction: column; gap: var(--ui-gap); min-width: 0; margin: 0; padding: 0; border: 0; }
+      .limit-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .limit-head .unit { display: inline-flex; align-items: center; gap: 6px; color: var(--ui-text-muted); }
+      .platform-block { display: flex; flex-direction: column; gap: var(--ui-gap); }
+    </style>
+  </head>
+  <body>
+    <div class="settings-shell">
+      <div class="drag-strip" data-tauri-drag-region></div>
+
+      <nav class="settings-nav" aria-label="Secciones de Meeting Transcriber">
+        <h1>Meeting Transcriber</h1>
+        <button type="button" class="nav-item is-active" data-tab="session" aria-current="page"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/></svg>Sesión</button>
+        <button type="button" class="nav-item" data-tab="general"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg>General y salida</button>
+        <button type="button" class="nav-item" data-tab="stt"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg>Transcripción (STT)</button>
+        <button type="button" class="nav-item" data-tab="ai"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>Inteligencia artificial</button>
+        <button type="button" class="nav-item" data-tab="corrections"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h7"/><path d="M17 15l3 3-3 3"/></svg>Correcciones y reporte</button>
+      </nav>
+
+      <main class="settings-main">
+        <!-- Sesión -->
+        <section class="tab-panel" id="tab-session" data-panel="session">
+          <header class="session-hero">
+            <h2>Sesión</h2>
+            <span class="ui-badge" id="sessionBadge" role="status">En espera</span>
+          </header>
+
+          <h3 class="ui-section-title">Resumen</h3>
+          <section class="ui-card" aria-label="Resumen de la configuración">
+            <div class="ui-row">
+              <div class="ui-text"><span class="ui-label">Motor de transcripción</span></div>
+              <span class="ui-hint session-value" id="summaryStt">Comprobando…</span>
+            </div>
+            <div class="ui-row">
+              <div class="ui-text"><span class="ui-label">Carpeta de salida</span></div>
+              <span class="ui-hint session-value" id="summaryOutput">—</span>
+            </div>
+            <div class="ui-row">
+              <div class="ui-text"><span class="ui-label">Post-procesado con IA</span></div>
+              <span class="ui-hint session-value" id="summaryAi">—</span>
+            </div>
+          </section>
+
+          <h3 class="ui-section-title">Sesión en vivo</h3>
+          <section class="ui-card" aria-label="Sesión en vivo">
+            <div class="ui-row">
+              <div class="ui-text">
+                <span class="ui-label">Tiempo transcurrido</span>
+                <span class="session-timer" id="sessionTimer">0:00</span>
+              </div>
+              <div class="ui-text session-stats">
+                <span class="ui-hint">Bloques guardados: <span id="sessionBlocks">0</span></span>
+                <span class="ui-hint">Último guardado: <span id="sessionLast">—</span></span>
+              </div>
+            </div>
+            <div class="ui-row ui-row--stack">
+              <span class="ui-status" id="sessionMessage" role="status" aria-live="polite"></span>
+              <span class="ui-status ui-status--error" id="actionError" role="alert"></span>
+              <div class="ui-actions">
+                <button class="ui-btn ui-btn--primary" type="button" id="primaryBtn">Iniciar transcripción</button>
+              </div>
+              <div class="ui-actions">
+                <button class="ui-btn" type="button" id="openNoteBtn">Abrir nota</button>
+                <button class="ui-btn" type="button" id="reanalyzeBtn" hidden>Re-analizar con IA</button>
+              </div>
+            </div>
+          </section>
+
+          <h3 class="ui-section-title">Analizar una nota existente</h3>
+          <span class="ui-hint">Analiza con IA una reunión ya transcrita (.md o .txt), aunque no se haya grabado con esta app.</span>
+          <section class="ui-card" aria-label="Analizar una nota existente">
+            <div class="ui-row ui-row--stack">
+              <input class="ui-input" type="text" id="analyzePath" readonly placeholder="Ningún archivo elegido" aria-label="Archivo elegido" />
+              <div class="ui-actions">
+                <button class="ui-btn" type="button" id="analyzePick">Elegir archivo…</button>
+                <button class="ui-btn ui-btn--primary" type="button" id="analyzeRun" disabled>Analizar con IA</button>
+              </div>
+            </div>
+            <div class="ui-row">
+              <span class="ui-status" id="analyzeStatus" role="status" aria-live="polite"></span>
+              <button class="ui-btn" type="button" id="analyzeOpen" hidden>Abrir nota</button>
+            </div>
+          </section>
+
+          <div class="ui-notice session-notice" role="note">
+            <span class="ui-hint">Avisa a los participantes antes de transcribir. El cumplimiento legal y el consentimiento recaen exclusivamente en el usuario; el software opera localmente sin asumir responsabilidad.</span>
+            <details class="ui-notice__details">
+              <summary class="ui-notice__summary">Ver aviso legal</summary>
+              <ol class="ui-hint">
+                <li>Los permisos del sistema operativo (micrófono y audio del sistema) solo autorizan el dispositivo; no sustituyen el consentimiento de los participantes.</li>
+                <li>En jurisdicciones de consentimiento de todas las partes, GDPR o políticas corporativas, es obligatorio informar y obtener autorización previa antes de grabar o transcribir.</li>
+                <li>El procesamiento es local (salvo si configuras una API externa); el usuario asume toda responsabilidad por el aviso, el consentimiento y la custodia de las notas generadas, eximiendo al software.</li>
+              </ol>
+            </details>
+          </div>
+        </section>
+
+        <!-- General y salida -->
+        <section class="tab-panel" id="tab-general" data-panel="general" hidden>
+          <h2>General y salida</h2>
+          <div class="ui-card">
+            <div class="ui-row">
+              <div class="ui-text"><label class="ui-label" for="outputDir">Carpeta de salida</label><span class="ui-hint">Donde se guardan las transcripciones e informes.</span></div>
+              <span class="ui-actions">
+                <input class="ui-input" type="text" id="outputDir" readonly />
+                <button class="ui-btn ui-btn--icon" type="button" id="pickOutputDir" aria-label="Elegir carpeta de salida" title="Elegir carpeta de salida"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h7l2 2h9v11H3z"/></svg></button>
+              </span>
+            </div>
+            <div class="ui-row">
+              <div class="ui-text"><label class="ui-label" for="transcriptionLanguage">Idioma de transcripción</label><span class="ui-hint">Idioma que se espera en la reunión.</span></div>
+              <select class="ui-select" id="transcriptionLanguage">
+                <option value="es">Español</option>
+                <option value="en">Inglés</option>
+                <option value="auto">Automático</option>
+              </select>
+            </div>
+            <div class="ui-row">
+              <div class="ui-text"><label class="ui-label" for="outputLanguage">Idioma del reporte</label><span class="ui-hint">Idioma en el que se redacta el informe.</span></div>
+              <select class="ui-select" id="outputLanguage">
+                <option value="Spanish">Español</option>
+                <option value="English">Inglés</option>
+              </select>
+            </div>
+            <div class="ui-row">
+              <div class="ui-text"><label class="ui-label" for="theme">Tema</label><span class="ui-hint">Sistema sigue la apariencia de macOS o Windows.</span></div>
+              <select class="ui-select" id="theme">
+                <option value="system">Sistema</option>
+                <option value="dark">Oscuro</option>
+                <option value="light">Claro</option>
+              </select>
+            </div>
+          </div>
+          <div class="ui-card">
+            <div class="ui-row">
+              <div class="ui-text"><span class="ui-label">Configuración heredada</span><span class="ui-hint">Trae los valores de un archivo .env de versiones anteriores. Reemplaza lo que hay en este formulario.</span></div>
+              <button class="ui-btn" type="button" id="importLegacyEnv">Importar .env heredado</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- Transcripción (STT) -->
+        <section class="tab-panel" id="tab-stt" data-panel="stt" hidden>
+          <h2>Transcripción (STT)</h2>
+          <div class="ui-card">
+            <div class="ui-row">
+              <div class="ui-text"><label class="ui-label" for="sttEngine">Motor</label><span class="ui-hint" id="sttEngineHint">Automático elige el motor adecuado para este equipo.</span></div>
+              <select class="ui-select" id="sttEngine">
+                <option value="auto">Automático</option>
+                <option value="whistle">Whistle</option>
+                <option value="whisper">Whisper</option>
+              </select>
+            </div>
+            <div class="ui-row" id="whisperModelRow">
+              <div class="ui-text"><label class="ui-label" for="whisperModel">Tamaño de Whisper</label><span class="ui-hint">Los modelos grandes son más precisos y más lentos.</span></div>
+              <select class="ui-select" id="whisperModel">
+                <option value="tiny">Tiny</option>
+                <option value="base">Base</option>
+                <option value="small">Small</option>
+                <option value="medium">Medium</option>
+              </select>
+            </div>
+            <div class="ui-row ui-row--stack">
+              <div class="ui-text">
+                <span class="ui-label" id="sttModelLabel">Modelo seleccionado</span>
+                <span class="ui-hint" id="sttDetail" role="status">Comprobando…</span>
+              </div>
+              <div class="ui-actions">
+                <span class="ui-badge" id="sttBadge">Comprobando</span>
+                <button class="ui-btn ui-btn--primary" type="button" id="sttInstall">Descargar modelo seleccionado</button>
+              </div>
+              <div class="ui-progress" id="sttProgress" aria-hidden="true" hidden><div id="sttProgressBar"></div></div>
+              <span class="ui-hint" id="sttProgressText" role="status"></span>
+            </div>
+          </div>
+          <div class="ui-card">
+            <div class="ui-row">
+              <div class="ui-text"><label class="ui-label" for="speakerMarkers">Marcar cambios de hablante</label><span class="ui-hint">Separa el texto transcrito por persona cuando el motor lo permite.</span></div>
+              <label class="ui-switch"><input type="checkbox" role="switch" id="speakerMarkers" /><span></span></label>
+            </div>
+            <div class="ui-row" id="whisperVadRow">
+              <div class="ui-text"><label class="ui-label" for="whisperVadFilter">Filtro de voz (VAD)</label><span class="ui-hint">Omite silencios y ruido de fondo antes de transcribir con Whisper.</span></div>
+              <label class="ui-switch"><input type="checkbox" role="switch" id="whisperVadFilter" /><span></span></label>
+            </div>
+          </div>
+
+          <!-- Plataforma: solo se muestra la sección del sistema actual -->
+          <div class="platform-block" id="platformMac" hidden>
+            <h3 class="ui-section-title">macOS · audio</h3>
+            <div class="ui-card">
+              <div class="ui-row">
+                <div class="ui-text"><label class="ui-label" for="macSystemGain">Ganancia del audio del sistema</label><span class="ui-hint">Factor de volumen para lo que suena en el equipo (0 o más).</span></div>
+                <input class="ui-input ui-input--num" type="number" id="macSystemGain" min="0" step="0.1" inputmode="decimal" />
+              </div>
+              <div class="ui-row">
+                <div class="ui-text"><label class="ui-label" for="macMicrophoneGain">Ganancia del micrófono</label><span class="ui-hint">Factor de volumen para tu voz (0 o más).</span></div>
+                <input class="ui-input ui-input--num" type="number" id="macMicrophoneGain" min="0" step="0.1" inputmode="decimal" />
+              </div>
+            </div>
+          </div>
+          <div class="platform-block" id="platformWin" hidden>
+            <h3 class="ui-section-title">Windows · dispositivos</h3>
+            <div class="ui-card">
+              <div class="ui-row">
+                <div class="ui-text"><label class="ui-label" for="windowsMicrophone">Micrófono</label><span class="ui-hint">Nombre del dispositivo de entrada. Vacío usa el predeterminado.</span></div>
+                <input class="ui-input" type="text" id="windowsMicrophone" autocomplete="off" />
+              </div>
+              <div class="ui-row">
+                <div class="ui-text"><label class="ui-label" for="windowsSpeaker">Altavoz o salida del sistema</label><span class="ui-hint">Dispositivo de salida cuyo audio se captura. Vacío usa el predeterminado.</span></div>
+                <input class="ui-input" type="text" id="windowsSpeaker" autocomplete="off" />
+              </div>
+              <div class="ui-row">
+                <div class="ui-text"><label class="ui-label" for="windowsBufferSeconds">Buffer (segundos)</label><span class="ui-hint">Mínimo 0.2 s. Más buffer evita cortes, pero añade retraso.</span></div>
+                <input class="ui-input ui-input--num" type="number" id="windowsBufferSeconds" min="0.2" step="0.1" inputmode="decimal" />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Inteligencia artificial -->
+        <section class="tab-panel" id="tab-ai" data-panel="ai" hidden>
+          <h2>Inteligencia artificial</h2>
+          <div class="ui-card">
+            <div class="ui-row">
+              <div class="ui-text"><label class="ui-label" for="aiEnabled">Usar IA para el informe</label><span class="ui-hint">Redacta el informe al terminar una sesión. Desactivada, solo se guarda la transcripción.</span></div>
+              <label class="ui-switch"><input type="checkbox" role="switch" id="aiEnabled" /><span></span></label>
+            </div>
+          </div>
+
+          <fieldset id="aiBody">
+            <div class="ui-card">
+              <div class="ui-row">
+                <div class="ui-text"><span class="ui-label">Fuente del modelo</span><span class="ui-hint">Local corre en tu equipo. API usa un servicio compatible con OpenAI.</span></div>
+                <div class="ui-segmented" role="radiogroup" aria-label="Fuente del modelo">
+                  <label><input type="radio" name="aiSource" id="aiSourceLocal" value="local" />Local</label>
+                  <label><input type="radio" name="aiSource" id="aiSourceApi" value="api" />API</label>
+                </div>
+              </div>
+            </div>
+
+            <!-- Grupo API -->
+            <div id="aiApiGroup" class="ui-stack" hidden>
+              <h3 class="ui-section-title">Servicio compatible con OpenAI</h3>
+              <div class="ui-card">
+                <div class="ui-row">
+                  <div class="ui-text"><label class="ui-label" for="aiEndpoint">Endpoint</label><span class="ui-hint">Dirección base del servicio, con /v1 si aplica.</span></div>
+                  <input class="ui-input" type="text" id="aiEndpoint" placeholder="http://127.0.0.1:8080/v1" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="ui-row">
+                  <div class="ui-text"><label class="ui-label" for="aiModelName">Nombre del modelo</label><span class="ui-hint">Identificador que expone el servicio.</span></div>
+                  <input class="ui-input" type="text" id="aiModelName" placeholder="gpt-4o, qwen2.5…" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="ui-row">
+                  <div class="ui-text"><label class="ui-label" for="aiApiKey">API key</label><span class="ui-hint" id="aiApiKeyStatus"></span></div>
+                  <input class="ui-input" type="password" id="aiApiKey" autocomplete="new-password" placeholder="Vacío conserva la guardada" />
+                </div>
+                <div class="ui-row">
+                  <div class="ui-text"><label class="ui-label" for="clearAiApiKey">Borrar la API key guardada</label><span class="ui-hint">Al guardar, elimina la clave almacenada.</span></div>
+                  <label class="ui-switch"><input type="checkbox" role="switch" id="clearAiApiKey" /><span></span></label>
+                </div>
+              </div>
+            </div>
+
+            <!-- Grupo local -->
+            <div id="aiLocalGroup" class="ui-stack" hidden>
+              <h3 class="ui-section-title">Modelo local</h3>
+              <div class="ui-card">
+                <div class="ui-row">
+                  <div class="ui-text"><label class="ui-label" for="aiModelsDir">Carpeta de modelos</label><span class="ui-hint">Donde viven los modelos descargados. Vacía usa la carpeta predeterminada.</span></div>
+                  <span class="ui-actions">
+                    <input class="ui-input" type="text" id="aiModelsDir" readonly />
+                    <button class="ui-btn ui-btn--icon" type="button" id="pickAiModelsDir" aria-label="Elegir carpeta de modelos" title="Elegir carpeta de modelos"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h7l2 2h9v11H3z"/></svg></button>
+                  </span>
+                </div>
+                <div class="ui-row">
+                  <div class="ui-text"><label class="ui-label" for="aiModelId">Modelo instalado</label><span class="ui-hint" id="aiModelsHint"></span><span class="ui-hint" id="aiModelProfileHint"></span><span class="ui-status ui-status--error" id="aiModelCompat" role="alert"></span></div>
+                  <span class="ui-actions">
+                    <select class="ui-select" id="aiModelId"></select>
+                    <button class="ui-btn ui-btn--danger" type="button" id="deleteAiModel" disabled>Eliminar</button>
+                  </span>
+                </div>
+                <div class="ui-row">
+                  <div class="ui-text"><span class="ui-label">Probar modelo</span><span class="ui-hint">Arranca el servidor local con el modelo seleccionado y comprueba que responde.</span><span class="ui-status" id="aiModelTest" role="status"></span></div>
+                  <span class="ui-actions">
+                    <button class="ui-btn ui-btn--soft" type="button" id="testAiModel">Probar modelo</button>
+                  </span>
+                </div>
+                <div class="ui-row">
+                  <div class="ui-text"><span class="ui-label">Runtime local</span><span class="ui-hint" id="aiRuntimeInfo" role="status">Comprobando…</span><span class="ui-hint" id="aiRuntimeRecommended"></span></div>
+                  <span class="ui-actions">
+                    <span class="ui-badge" id="aiRuntimeBadge">Comprobando</span>
+                    <button class="ui-btn" type="button" id="installAiRuntime" hidden>Instalar runtime</button>
+                    <button class="ui-btn" type="button" id="updateAiRuntime" hidden>Actualizar runtime</button>
+                  </span>
+                </div>
+                <div class="ui-row">
+                  <span class="ui-hint" id="aiRuntimeProgress" role="status"></span>
+                </div>
+              </div>
+
+              <h3 class="ui-section-title">Descargar de Hugging Face</h3>
+              <div class="ui-card">
+                <div class="ui-row">
+                  <div class="ui-text"><label class="ui-label" for="hubUrl">Modelo</label><span class="ui-hint">Pega la URL o «usuario/modelo». No necesitas cuenta. Antes de descargar se comprueba la compatibilidad y el espacio.</span></div>
+                  <input class="ui-input" type="text" id="hubUrl" placeholder="mlx-community/Qwen3-4B-4bit" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="ui-row" id="hubDetail" hidden>
+                  <div class="ui-text"><span class="ui-label" id="hubTitle"></span><span class="ui-hint" id="hubMeta"></span><span class="ui-status" id="hubVerdict" role="status"></span></div>
+                  <span class="ui-badge" id="hubFit"></span>
+                </div>
+                <div class="ui-row" id="hubQuantRow" hidden>
+                  <div class="ui-text"><label class="ui-label" for="hubQuant">Cuantización</label><span class="ui-hint">Variante GGUF que se descargará.</span></div>
+                  <select class="ui-select" id="hubQuant"></select>
+                </div>
+                <div class="ui-row ui-row--stack" id="hubProgressRow" hidden>
+                  <div class="ui-progress" aria-hidden="true"><div id="hubBar"></div></div>
+                  <span class="ui-hint" id="hubProgressText" role="status"></span>
+                </div>
+                <div class="ui-row">
+                  <span class="ui-status" id="hubMessage" role="status"></span>
+                  <span class="ui-actions">
+                    <button class="ui-btn" type="button" id="hubSecondary" hidden></button>
+                    <button class="ui-btn ui-btn--primary" type="button" id="hubPrimary">Analizar</button>
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Contexto y respuesta (ambas fuentes) -->
+            <h3 class="ui-section-title">Contexto y respuesta</h3>
+            <div class="ui-card">
+              <div class="ui-row ui-row--stack">
+                <div class="limit-head">
+                  <div class="ui-text"><label class="ui-label" for="contextLimit">Tamaño de contexto</label><span class="ui-hint">Memoria total que usa el modelo por informe.</span></div>
+                  <span class="unit"><input class="ui-input ui-input--num" type="number" id="contextLimit" min="2048" max="131072" step="1024" inputmode="numeric" /> tokens</span>
+                </div>
+                <input class="ui-range" type="range" id="contextLimitRange" min="2048" max="131072" step="1024" aria-label="Tamaño de contexto" />
+              </div>
+              <div class="ui-row ui-row--stack">
+                <div class="limit-head">
+                  <div class="ui-text"><label class="ui-label" for="maxOutput">Máximo de respuesta</label><span class="ui-hint">Tokens reservados para la respuesta del modelo.</span></div>
+                  <span class="unit"><input class="ui-input ui-input--num" type="number" id="maxOutput" min="128" max="16384" step="128" inputmode="numeric" /> tokens</span>
+                </div>
+                <input class="ui-range" type="range" id="maxOutputRange" min="128" max="16384" step="128" aria-label="Máximo de tokens de respuesta" />
+              </div>
+              <div class="ui-row">
+                <span class="ui-hint" id="limitsHint"></span>
+              </div>
+            </div>
+
+            <h3 class="ui-section-title">Parámetros de generación</h3>
+            <div class="ui-card">
+              <div class="ui-row">
+                <div class="ui-text"><label class="ui-label" for="useHfRecommendedConfig">Usar configuración sugerida de Hugging Face</label><span class="ui-hint">Aplica automáticamente temperature, top_p, top_k, repetition_penalty y límite de contexto publicados por el modelo.</span></div>
+                <label class="ui-switch"><input type="checkbox" role="switch" id="useHfRecommendedConfig" /><span></span></label>
+              </div>
+              <div class="ui-row">
+                <div class="ui-text"><label class="ui-label" for="aiDisableThinking">Desactivar modo thinking para tool calling</label><span class="ui-hint">Recomendado para modelos como Qwen3: evita que gasten tokens pensando antes de llamar a save_meeting_report.</span></div>
+                <label class="ui-switch"><input type="checkbox" role="switch" id="aiDisableThinking" /><span></span></label>
+              </div>
+            </div>
+            <div class="ui-card" id="aiManualSamplingGroup">
+              <div class="ui-row">
+                <div class="ui-text"><label class="ui-label" for="aiTemperature">Temperatura</label><span class="ui-hint">De 0 a 2. Vacío usa el valor por defecto.</span></div>
+                <input class="ui-input ui-input--num" type="number" id="aiTemperature" min="0" max="2" step="0.05" inputmode="decimal" placeholder="Por defecto" />
+              </div>
+              <div class="ui-row">
+                <div class="ui-text"><label class="ui-label" for="aiTopP">Top P</label><span class="ui-hint">De 0.05 a 1. Vacío usa el valor por defecto.</span></div>
+                <input class="ui-input ui-input--num" type="number" id="aiTopP" min="0.05" max="1" step="0.05" inputmode="decimal" placeholder="Por defecto" />
+              </div>
+              <div class="ui-row">
+                <div class="ui-text"><label class="ui-label" for="aiTopK">Top K</label><span class="ui-hint">Entero de 1 o más. Vacío usa el valor por defecto.</span></div>
+                <input class="ui-input ui-input--num" type="number" id="aiTopK" min="1" step="1" inputmode="numeric" placeholder="Por defecto" />
+              </div>
+              <div class="ui-row">
+                <div class="ui-text"><label class="ui-label" for="aiRepetitionPenalty">Penalización de repetición</label><span class="ui-hint">De 0.5 a 2. Vacío usa el valor por defecto.</span></div>
+                <input class="ui-input ui-input--num" type="number" id="aiRepetitionPenalty" min="0.5" max="2" step="0.05" inputmode="decimal" placeholder="Por defecto" />
+              </div>
+            </div>
+          </fieldset>
+        </section>
+
+        <!-- Correcciones y reporte -->
+        <section class="tab-panel" id="tab-corrections" data-panel="corrections" hidden>
+          <h2>Correcciones y reporte</h2>
+          <div class="ui-card">
+            <div class="ui-row">
+              <div class="ui-text"><label class="ui-label" for="minReportWords">Mínimo de palabras en la transcripción</label><span class="ui-hint">Si la transcripción tiene menos palabras habladas que este mínimo (por ejemplo, una prueba corta o silencio), no se llama a la IA y se guarda un aviso de contenido insuficiente. No limita el largo del informe generado.</span></div>
+              <input class="ui-input ui-input--num" type="number" id="minReportWords" min="0" step="10" inputmode="numeric" />
+            </div>
+            <div class="ui-row">
+              <div class="ui-text"><label class="ui-label" for="replaceExistingReport">Reemplazar informe existente</label><span class="ui-hint">Sobrescribe el informe anterior de la misma sesión.</span></div>
+              <label class="ui-switch"><input type="checkbox" role="switch" id="replaceExistingReport" /><span></span></label>
+            </div>
+          </div>
+
+          <h3 class="ui-section-title">Reglas de corrección</h3>
+          <span class="ui-hint">Se aplican en orden antes del análisis. Mayús.: distingue entre mayúsculas y minúsculas. Palabra completa: solo reemplaza palabras aisladas, sin tocar partes internas de otras palabras.</span>
+          <div class="ui-rule-list" id="ruleList">
+            <div class="ui-rule-row ui-rule-row--head" id="ruleHead">
+              <span>Buscar</span>
+              <span>Reemplazar por</span>
+              <span>Opciones</span>
+            </div>
+          </div>
+          <div class="ui-hint" id="ruleEmpty" hidden>Sin reglas. Se aplican en orden al texto transcrito. Mayúsculas y palabra completa se activan por regla.</div>
+          <div class="ui-actions">
+            <button class="ui-btn" type="button" id="addRule">Añadir regla</button>
+          </div>
+
+          <h3 class="ui-section-title">Skill de análisis (meeting-report-analyst)</h3>
+          <div class="ui-card">
+            <div class="ui-row ui-row--stack">
+              <div class="ui-text"><label class="ui-label" for="reportSkillPrompt">Instrucciones</label><span class="ui-hint">Instrucciones que sigue el modelo de IA para analizar la reunión y ejecutar la herramienta de guardado. Puedes editarlas o restablecer las predeterminadas.</span></div>
+              <textarea class="ui-textarea ui-textarea--tall" id="reportSkillPrompt" spellcheck="false"></textarea>
+              <div class="ui-actions">
+                <button class="ui-btn" type="button" id="resetSkillPrompt">Restablecer skill por defecto</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="settings-footer" hidden>
+        <div id="settingsError" class="ui-status ui-status--error" role="alert"></div>
+        <div id="settingsSaved" class="ui-status ui-status--ok" role="status"></div>
+        <button class="ui-btn ui-btn--primary" type="button" id="saveSettings">Guardar cambios</button>
+      </footer>
+    </div>
+
+    <script src="assets/app.js"></script>
+    <script>
+      (function () {
+        "use strict";
+
+        var M = window.MeetingApp;
+        var el = M.el;
+
+        function $(id) { return document.getElementById(id); }
+        function errText(e) { return String((e && e.message) || e || "Error desconocido"); }
+        function parseNum(id) {
+          var raw = $(id).value.trim();
+          return raw === "" ? NaN : Number(raw);
+        }
+        function setStatus(node, text, kind) {
+          node.className = "ui-status" + (kind ? " ui-status--" + kind : "");
+          node.textContent = text || "";
+        }
+        function clearStatus() {
+          setStatus($("settingsError"), "", "");
+          setStatus($("settingsSaved"), "", "");
+        }
+        function showError(text) {
+          setStatus($("settingsSaved"), "", "");
+          setStatus($("settingsError"), text, "error");
+        }
+        function showSaved(text) {
+          setStatus($("settingsError"), "", "");
+          setStatus($("settingsSaved"), text, "ok");
+        }
+        function selectValue(select, value) {
+          var known = Array.prototype.some.call(select.options, function (o) { return o.value === value; });
+          if (value && !known) select.appendChild(el("option", { value: value }, value));
+          select.value = value;
+        }
+
+        var CTX = { min: 2048, max: 131072 };
+        var OUT = { min: 128, max: 16384 };
+        var MIN_INPUT = 1024;
+        var FIT = {
+          fits: { cls: "ui-badge--ok", label: "Cabe", status: "" },
+          tight: { cls: "ui-badge--warn", label: "Justo", status: "ui-status--warn" },
+          tooBig: { cls: "ui-badge--error", label: "No cabe", status: "ui-status--error" }
+        };
+
+        // Session phases and snapshot (the live session card on the Sesión tab).
+        var PHASES = {
+          idle: { label: "En espera", cls: "", text: "Lista para transcribir.", tone: "" },
+          loading_engine: { label: "Cargando motor", cls: "ui-badge--warn", text: "Cargando motor de transcripción…", tone: "" },
+          recording: { label: "Grabando", cls: "ui-badge--ok", text: "Transcribiendo en directo.", tone: "" },
+          stopping: { label: "Finalizando", cls: "ui-badge--warn", text: "Finalizando audio…", tone: "" },
+          analyzing_ai: { label: "Analizando", cls: "ui-badge--warn", text: "Generando reporte IA…", tone: "" },
+          done: { label: "Completada", cls: "ui-badge--ok", text: "Sesión guardada.", tone: "ok" },
+          error: { label: "Error", cls: "ui-badge--error", text: "Ha ocurrido un error.", tone: "error" }
+        };
+        var ENGINE_LABELS = { auto: "Automático", whistle: "Whistle", whisper: "Whisper" };
+        var DEFAULT_SNAPSHOT = {
+          phase: "idle",
+          elapsedSeconds: 0,
+          blocksSaved: 0,
+          lastTimestamp: "",
+          notePath: "",
+          message: "",
+          aiEnabled: false
+        };
+
+        var state = {
+          view: null,
+          rules: [],
+          modelsDir: "",
+          modelsDirDirty: false,
+          modelId: "",
+          localModels: [],
+          runtime: null,
+          hub: { phase: "idle" },
+          analyzePath: "",
+          snapshot: DEFAULT_SNAPSHOT,
+          clockBase: 0,
+          clockAt: Date.now(),
+          busy: { save: false, stt: false, runtime: false, delete: false, action: false, rerun: false, test: false, analyze: false }
+        };
+
+        // ---------- Tabs ----------
+
+        function showTab(name) {
+          document.querySelectorAll(".nav-item").forEach(function (item) {
+            var active = item.dataset.tab === name;
+            item.classList.toggle("is-active", active);
+            if (active) item.setAttribute("aria-current", "page");
+            else item.removeAttribute("aria-current");
+          });
+          document.querySelectorAll(".tab-panel").forEach(function (panel) {
+            panel.hidden = panel.dataset.panel !== name;
+          });
+          // Save applies to the four settings tabs only; the Sesión tab has no form to save.
+          document.querySelector(".settings-footer").hidden = (name === "session");
+          document.querySelector(".settings-main").scrollTop = 0;
+        }
+
+        // ---------- Session: live state ----------
+
+        function showActionError(text) { setStatus($("actionError"), text, "error"); }
+        function clearActionError() { setStatus($("actionError"), "", ""); }
+
+        function currentPhase() { return state.snapshot.phase || "idle"; }
+        function phaseInfo(phase) { return PHASES[phase] || PHASES.idle; }
+
+        function setSnapshot(s) {
+          if (!s || typeof s !== "object" || typeof s.phase !== "string") return;
+          state.snapshot = Object.assign({}, DEFAULT_SNAPSHOT, s);
+          state.clockBase = Number(state.snapshot.elapsedSeconds) || 0;
+          state.clockAt = Date.now();
+          renderSession();
+        }
+
+        // Between backend events the timer ticks locally while recording.
+        function renderTimer() {
+          var seconds = state.clockBase;
+          if (currentPhase() === "recording") seconds += (Date.now() - state.clockAt) / 1000;
+          $("sessionTimer").textContent = M.formatDuration(seconds);
+        }
+
+        function renderPrimary(phase) {
+          var btn = $("primaryBtn");
+          var label = "Iniciar transcripción";
+          var cls = "ui-btn ui-btn--primary";
+          var disabled = false;
+          if (phase === "loading_engine" || phase === "recording") {
+            label = "Detener y guardar";
+            cls = "ui-btn ui-btn--danger";
+          } else if (phase === "stopping") {
+            label = "Finalizando…";
+            disabled = true;
+          } else if (phase === "analyzing_ai") {
+            label = "Analizando…";
+            disabled = true;
+          }
+          btn.className = cls;
+          btn.textContent = label;
+          btn.disabled = disabled || state.busy.action;
+        }
+
+        function renderSecondary(phase) {
+          var note = state.snapshot.notePath || "";
+          $("openNoteBtn").disabled = !note;
+          var rerun = $("reanalyzeBtn");
+          rerun.hidden = !(note && phase === "done");
+          rerun.disabled = state.busy.rerun || state.busy.action;
+        }
+
+        function renderSession() {
+          var s = state.snapshot;
+          var phase = currentPhase();
+          var info = phaseInfo(phase);
+          var badge = $("sessionBadge");
+          badge.className = "ui-badge" + (info.cls ? " " + info.cls : "");
+          badge.textContent = info.label;
+          $("sessionBlocks").textContent = String(Number(s.blocksSaved) || 0);
+          $("sessionLast").textContent = s.lastTimestamp ? String(s.lastTimestamp) : "—";
+          setStatus($("sessionMessage"), s.message || info.text, info.tone);
+          renderPrimary(phase);
+          renderSecondary(phase);
+          renderTimer();
+        }
+
+        async function runAction(cmd) {
+          if (state.busy.action) return;
+          state.busy.action = true;
+          clearActionError();
+          renderSession();
+          try {
+            setSnapshot(await M.invoke(cmd));
+          } catch (e) {
+            var what = cmd === "start_session" ? "iniciar la sesión" : "detener la sesión";
+            showActionError("No se pudo " + what + ": " + errText(e));
+          } finally {
+            state.busy.action = false;
+            renderSession();
+          }
+        }
+
+        function onPrimary() {
+          var phase = currentPhase();
+          if (phase === "loading_engine" || phase === "recording") {
+            runAction("stop_session");
+          } else if (phase === "idle" || phase === "done" || phase === "error") {
+            runAction("start_session");
+          }
+        }
+
+        async function openNote() {
+          var path = state.snapshot.notePath;
+          if (!path) return;
+          clearActionError();
+          try {
+            await M.invoke("open_note", { path: path });
+          } catch (e) {
+            showActionError("No se pudo abrir la nota: " + errText(e));
+          }
+        }
+
+        async function rerunAi() {
+          var path = state.snapshot.notePath;
+          if (!path || state.busy.rerun || currentPhase() !== "done") return;
+          state.busy.rerun = true;
+          setStatus($("actionError"), "Re-analizando con IA…", "");
+          renderSession();
+          try {
+            await M.invoke("run_report_on_file", { path: path });
+            setStatus($("actionError"), "Re-análisis terminado.", "ok");
+          } catch (e) {
+            showActionError("No se pudo re-analizar: " + errText(e));
+          } finally {
+            state.busy.rerun = false;
+            renderSession();
+          }
+        }
+
+        // ---------- Session: settings summary ----------
+
+        function sttSummary(v) {
+          if (v.sttEngine === "whistle") return "Whistle (modelo único)";
+          if (v.sttEngine === "auto" && v.whistleSupported) return "Automático (Whistle)";
+          var model = v.whisperModel || "small";
+          if (v.sttEngine === "auto") return "Automático (Whisper · " + model + ")";
+          return "Whisper · " + model;
+        }
+
+        function aiSummary(v) {
+          if (!v.aiEnabled) return "Desactivada";
+          var model = v.aiModelName || v.aiModelId;
+          return "Activada" + (model ? " · " + model : "");
+        }
+
+        // Called after settings are loaded or saved, so the Sesión tab always shows the current config.
+        function renderSessionSummary(v) {
+          if (!v) return;
+          $("summaryStt").textContent = sttSummary(v);
+          $("summaryOutput").textContent = v.outputDir || "Sin carpeta configurada";
+          $("summaryOutput").title = v.outputDir || "";
+          $("summaryAi").textContent = aiSummary(v);
+        }
+
+        // ---------- Render saved settings ----------
+
+        function render(v) {
+          state.view = v;
+          state.modelsDir = v.aiModelsDir || "";
+          state.modelsDirDirty = false;
+          M.applyTheme(v.theme);
+
+          // General
+          $("outputDir").value = v.outputDir || "";
+          selectValue($("transcriptionLanguage"), v.transcriptionLanguage);
+          selectValue($("outputLanguage"), v.outputLanguage);
+          selectValue($("theme"), v.theme);
+
+          // STT
+          $("sttEngine").querySelector('option[value="whistle"]').disabled = !v.whistleSupported;
+          $("sttEngine").value = v.sttEngine;
+          selectValue($("whisperModel"), v.whisperModel);
+          $("speakerMarkers").checked = !!v.speakerMarkers;
+          $("whisperVadFilter").checked = !!v.whisperVadFilter;
+          updateSttVisibility();
+          $("macSystemGain").value = v.macSystemGain;
+          $("macMicrophoneGain").value = v.macMicrophoneGain;
+          $("windowsMicrophone").value = v.windowsMicrophone || "";
+          $("windowsSpeaker").value = v.windowsSpeaker || "";
+          $("windowsBufferSeconds").value = v.windowsBufferSeconds;
+          $("platformMac").hidden = v.platformOs !== "macos";
+          $("platformWin").hidden = v.platformOs !== "windows";
+
+          // AI
+          $("aiEnabled").checked = !!v.aiEnabled;
+          $("aiSourceLocal").checked = v.aiSource === "local";
+          $("aiSourceApi").checked = v.aiSource !== "local";
+          $("aiEndpoint").value = v.aiEndpoint || "";
+          $("aiModelName").value = v.aiModelName || "";
+          $("aiApiKey").value = "";
+          $("clearAiApiKey").checked = false;
+          $("aiApiKeyStatus").textContent = v.aiApiKeyConfigured
+            ? "Hay una clave guardada. Déjala vacía para conservarla."
+            : "No hay clave guardada.";
+          $("useHfRecommendedConfig").checked = !!v.useHfRecommendedConfig;
+          $("aiDisableThinking").checked = !!v.aiDisableThinking;
+          $("aiTemperature").value = numText(v.aiTemperature);
+          $("aiTopP").value = numText(v.aiTopP);
+          $("aiTopK").value = numText(v.aiTopK);
+          $("aiRepetitionPenalty").value = numText(v.aiRepetitionPenalty);
+          updateSamplingVisibility();
+          showModelsDir();
+          setLimits(v.contextLimitTokens, v.maxOutputTokens);
+          updateAiVisibility();
+
+          // Corrections
+          state.rules = (v.corrections || []).map(function (r) {
+            return {
+              find: r.find || "",
+              replace: r.replace || "",
+              caseSensitive: !!(r.caseSensitive || r.case_sensitive),
+              wholeWord: !!(r.wholeWord || r.whole_word)
+            };
+          });
+          renderRules();
+          $("minReportWords").value = v.minReportWords;
+          $("replaceExistingReport").checked = !!v.replaceExistingReport;
+          $("reportSkillPrompt").value = v.reportSkillPrompt || "";
+
+          state.modelId = v.aiModelId || "";
+          refreshModels();
+          refreshStt();
+          refreshAiRuntime();
+        }
+
+        function buildUpdate() {
+          // Manual sampling values are sent only while the Hugging Face profile is off; blank fields send null.
+          var useHf = $("useHfRecommendedConfig").checked;
+          var temperature = useHf ? null : optNum("aiTemperature");
+          var topP = useHf ? null : optNum("aiTopP");
+          var topK = useHf ? null : optNum("aiTopK");
+          var repetition = useHf ? null : optNum("aiRepetitionPenalty");
+          var update = {
+            outputDir: $("outputDir").value,
+            transcriptionLanguage: $("transcriptionLanguage").value,
+            outputLanguage: $("outputLanguage").value,
+            theme: $("theme").value,
+            sttEngine: $("sttEngine").value,
+            whisperModel: $("whisperModel").value,
+            speakerMarkers: $("speakerMarkers").checked,
+            whisperVadFilter: $("whisperVadFilter").checked,
+            windowsMicrophone: $("windowsMicrophone").value,
+            windowsSpeaker: $("windowsSpeaker").value,
+            windowsBufferSeconds: parseNum("windowsBufferSeconds"),
+            macSystemGain: parseNum("macSystemGain"),
+            macMicrophoneGain: parseNum("macMicrophoneGain"),
+            aiEnabled: $("aiEnabled").checked,
+            aiSource: $("aiSourceLocal").checked ? "local" : "api",
+            aiModelsDir: state.modelsDir,
+            aiModelId: state.modelId,
+            aiEndpoint: $("aiEndpoint").value.trim(),
+            aiModelName: $("aiModelName").value.trim(),
+            clearAiApiKey: $("clearAiApiKey").checked,
+            useHfRecommendedConfig: useHf,
+            aiDisableThinking: $("aiDisableThinking").checked,
+            aiTemperature: temperature,
+            aiTopP: topP,
+            aiTopK: topK,
+            aiRepetitionPenalty: repetition,
+            // Clears the stored overrides first (blank or Hugging Face mode), then applies the non-blank ones.
+            clearAiSamplingOverrides: useHf || [temperature, topP, topK, repetition].some(function (x) { return x === null; }),
+            contextLimitTokens: parseNum("contextLimit"),
+            maxOutputTokens: parseNum("maxOutput"),
+            minReportWords: parseNum("minReportWords"),
+            replaceExistingReport: $("replaceExistingReport").checked,
+            reportSkillPrompt: $("reportSkillPrompt").value,
+            corrections: collectRules()
+          };
+          var key = $("aiApiKey").value.trim();
+          if (key) update.aiApiKey = key;
+          return update;
+        }
+
+        // ---------- General ----------
+
+        async function pickDirectory(title) {
+          try {
+            var dir = await M.invoke("pick_directory", { title: title });
+            return typeof dir === "string" && dir ? dir : null;
+          } catch (e) {
+            showError("No se pudo abrir el selector de carpetas: " + errText(e));
+            return null;
+          }
+        }
+
+        async function importLegacyEnv() {
+          if (!window.confirm("Importar el .env heredado reemplazará los valores de este formulario. ¿Continuar?")) return;
+          try {
+            var view = await M.invoke("import_legacy_dotenv");
+            render(view);
+            renderSessionSummary(view);
+            showSaved("Valores importados desde el .env heredado.");
+          } catch (e) {
+            showError("No se pudo importar el .env: " + errText(e));
+          }
+        }
+
+        // ---------- STT ----------
+
+        // Whistle is active when chosen explicitly, or when Automático resolves to it on this machine.
+        function effectiveSttEngine() {
+          var choice = $("sttEngine").value;
+          if (choice === "whistle") return "whistle";
+          if (choice === "auto" && state.view && state.view.whistleSupported) return "whistle";
+          return "whisper";
+        }
+
+        // Whisper-only controls (model size, VAD filter) are hidden while Whistle is active.
+        function updateSttVisibility() {
+          var isWhistle = effectiveSttEngine() === "whistle";
+          $("whisperModelRow").hidden = isWhistle;
+          $("whisperVadRow").hidden = isWhistle;
+          if (isWhistle) {
+            $("sttEngineHint").textContent = "Whistle usa un único modelo fijo (whistle.cact, 16.9 MB) sin variantes de tamaño.";
+          } else if ($("sttEngine").value === "auto") {
+            $("sttEngineHint").textContent = "Automático usa Whisper en este equipo.";
+          } else {
+            $("sttEngineHint").textContent = "Whisper permite elegir tamaño de modelo y filtro de voz (VAD).";
+          }
+        }
+
+        function sttSelection() {
+          // The backend's AppSettings is snake_case; only the fields the probe reads are sent.
+          return { stt_engine: $("sttEngine").value, whisper_model: $("whisperModel").value };
+        }
+
+        async function refreshStt() {
+          try {
+            renderStt(await M.invoke("stt_model_status", { settings: sttSelection() }));
+          } catch (e) {
+            $("sttDetail").textContent = errText(e);
+          }
+        }
+
+        function renderStt(s) {
+          $("sttModelLabel").textContent = s.modelLabel || "Modelo seleccionado";
+          $("sttDetail").textContent = s.detail || "";
+          var badge = $("sttBadge");
+          badge.className = "ui-badge " + (s.installed ? "ui-badge--ok" : "ui-badge--warn");
+          badge.textContent = s.installed ? "Instalado" : "No instalado";
+        }
+
+        async function installStt() {
+          if (state.busy.stt) return;
+          state.busy.stt = true;
+          $("sttInstall").disabled = true;
+          $("sttProgress").hidden = false;
+          $("sttProgress").classList.add("ui-progress--indeterminate");
+          $("sttProgressBar").style.width = "";
+          setStatus($("sttProgressText"), "Preparando la descarga…", "");
+          try {
+            var status = await M.invoke("install_selected_stt_model", { settings: sttSelection() });
+            $("sttProgress").classList.remove("ui-progress--indeterminate");
+            $("sttProgressBar").style.width = "100%";
+            renderStt(status);
+            if (state.view) renderSessionSummary(state.view);
+            setStatus($("sttProgressText"), "Motor de transcripción listo.", "ok");
+          } catch (e) {
+            $("sttProgress").classList.remove("ui-progress--indeterminate");
+            setStatus($("sttProgressText"), "No se pudo descargar: " + errText(e), "error");
+          } finally {
+            state.busy.stt = false;
+            $("sttInstall").disabled = false;
+          }
+        }
+
+        // ---------- AI: source, runtime, local models ----------
+
+        function updateAiVisibility() {
+          var local = $("aiSourceLocal").checked;
+          $("aiApiGroup").hidden = local;
+          $("aiLocalGroup").hidden = !local;
+          $("aiBody").disabled = !$("aiEnabled").checked;
+          updateLimitsHint();
+        }
+
+        function showModelsDir() {
+          var dir = state.modelsDir || (state.view && state.view.defaultAiModelsDir) || "";
+          $("aiModelsDir").value = dir;
+        }
+
+        var SAMPLING = [
+          { id: "aiTemperature", min: 0, max: 2, message: "La temperatura debe estar entre 0 y 2." },
+          { id: "aiTopP", min: 0.05, max: 1, message: "Top P debe estar entre 0.05 y 1." },
+          { id: "aiTopK", min: 1, integer: true, message: "Top K debe ser un entero de 1 o más." },
+          { id: "aiRepetitionPenalty", min: 0.5, max: 2, message: "La penalización de repetición debe estar entre 0.5 y 2." }
+        ];
+
+        function known(x) { return x !== null && x !== undefined; }
+        function numText(n) { return known(n) ? String(n) : ""; }
+        function optNum(id) {
+          var raw = $(id).value.trim();
+          return raw === "" ? null : Number(raw);
+        }
+        function updateSamplingVisibility() {
+          $("aiManualSamplingGroup").hidden = $("useHfRecommendedConfig").checked;
+        }
+        // Range check for the manual overrides; blank fields are skipped (they mean "default").
+        function samplingProblem() {
+          var problem = null;
+          SAMPLING.forEach(function (field) {
+            if (problem || $(field.id).value.trim() === "") return;
+            var n = optNum(field.id);
+            var ok = field.integer
+              ? Number.isInteger(n) && n >= field.min
+              : isFinite(n) && n >= field.min && n <= field.max;
+            if (!ok) problem = { tab: "ai", message: field.message, focus: $(field.id) };
+          });
+          return problem;
+        }
+
+        function installedModel() {
+          var id = state.modelId;
+          var found = state.localModels.filter(function (m) { return m.id === id; });
+          return id && found.length ? found[0] : null;
+        }
+
+        // Compact summary of a SuggestedModelConfig, e.g. "temp 0.7 · top_p 0.8 · top_k 20 · ctx máx 32.768 · thinking off para tools".
+        function profileSummary(c) {
+          var parts = [];
+          if (known(c.temperature)) parts.push("temp " + String(Math.round(c.temperature * 1000) / 1000));
+          if (known(c.topP)) parts.push("top_p " + String(Math.round(c.topP * 1000) / 1000));
+          if (known(c.topK)) parts.push("top_k " + c.topK);
+          if (known(c.repetitionPenalty)) parts.push("rep " + String(Math.round(c.repetitionPenalty * 1000) / 1000));
+          if (known(c.maxContextTokens)) parts.push("ctx máx " + c.maxContextTokens.toLocaleString("es"));
+          if (c.supportsThinkingToggle && known(c.recommendedThinking)) {
+            parts.push(c.recommendedThinking ? "thinking on" : "thinking off para tools");
+          }
+          return parts.join(" · ");
+        }
+
+        function suggestedText(c, withSource) {
+          var summary = c ? profileSummary(c) : "";
+          if (!summary) return "";
+          var source = withSource && c.sourceSummary ? " (" + c.sourceSummary + ")" : "";
+          return "Sugerido HF" + source + ": " + summary;
+        }
+
+        function updateModelControls() {
+          var model = installedModel();
+          $("deleteAiModel").disabled = !model || state.busy.delete || state.busy.save || state.modelsDirDirty;
+          $("testAiModel").disabled = !model || state.busy.test || state.busy.save || state.modelsDirDirty;
+          $("aiModelProfileHint").textContent = model ? suggestedText(model.suggestedConfig, true) : "";
+          updateLimitsHint();
+        }
+
+        async function deleteAiModel() {
+          var id = state.modelId;
+          if (!installedModel() || state.busy.delete || state.busy.save) return;
+          if (!window.confirm("¿Eliminar el modelo local «" + id + "» del disco? Esta acción no se puede deshacer.")) return;
+          state.busy.delete = true;
+          updateModelControls();
+          clearStatus();
+          try {
+            await M.invoke("delete_local_ai_model", { modelId: id });
+            state.modelId = "";
+            showSaved("Modelo «" + id + "» eliminado del disco.");
+          } catch (e) {
+            showError("No se pudo eliminar el modelo: " + errText(e));
+          } finally {
+            state.busy.delete = false;
+          }
+          await refreshModels();
+        }
+
+        async function refreshModels() {
+          var select = $("aiModelId");
+          var wanted = state.modelId;
+          var hint = $("aiModelsHint");
+          var models = [];
+          try {
+            models = (await M.invoke("list_local_ai_models", { dir: state.modelsDir || null })) || [];
+          } catch (e) {
+            state.localModels = [];
+            hint.textContent = "No se pudieron listar los modelos: " + errText(e);
+            updateModelControls();
+            refreshModelCompat();
+            return;
+          }
+          state.localModels = models;
+          var options = [el("option", { value: "" }, models.length ? "Selecciona un modelo" : "No hay modelos en esta carpeta")];
+          models.forEach(function (m) {
+            options.push(el("option", { value: m.id }, m.name + " · " + M.formatBytes(m.sizeBytes) + " · " + m.format));
+          });
+          if (wanted && !models.some(function (m) { return m.id === wanted; })) {
+            options.push(el("option", { value: wanted }, wanted + " (no disponible)"));
+          }
+          select.replaceChildren.apply(select, options);
+          select.value = wanted || "";
+          if (state.modelsDirDirty) {
+            hint.textContent = models.length
+              ? models.length + " modelo(s) encontrados. Guarda los cambios para usar esta carpeta."
+              : "No hay modelos en esta carpeta. Guarda los cambios para usarla.";
+          } else {
+            hint.textContent = models.length
+              ? models.length + " modelo(s) en la carpeta guardada."
+              : "Descarga un modelo desde Hugging Face o copia uno en la carpeta.";
+          }
+          updateModelControls();
+          refreshModelCompat();
+        }
+
+        function runtimeLabel(kind) {
+          return kind === "gguf" ? "GGUF (llama.cpp)" : "MLX";
+        }
+
+        function renderRuntime(s) {
+          state.runtime = s;
+          // mlx-lm reports its installed version; otherwise (llama.cpp or not installed) show the detail.
+          $("aiRuntimeInfo").textContent = s.version ? "mlx-lm " + s.version + " instalado." : (s.detail || "");
+          var rec = state.view && state.view.recommendedRuntime;
+          $("aiRuntimeRecommended").textContent = rec ? "Recomendado para este equipo: " + runtimeLabel(rec) + "." : "";
+          var badge = $("aiRuntimeBadge");
+          badge.className = "ui-badge " + (s.installed ? "ui-badge--ok" : "ui-badge--warn");
+          badge.textContent = s.installed ? "Instalado" : "No instalado";
+          var button = $("installAiRuntime");
+          button.hidden = s.installed || !s.canInstall;
+          button.textContent = "Instalar runtime " + runtimeLabel(s.kind);
+          var update = $("updateAiRuntime");
+          update.hidden = !s.updateAvailable;
+          update.textContent = "Actualizar a " + (s.latest || "");
+        }
+
+        async function refreshAiRuntime() {
+          var previous = state.runtime;
+          try {
+            var s = await M.invoke("ai_runtime_status");
+            // The status command does not know the latest version. Keep the last check's answer for the same install so the update button does not flicker.
+            if (previous && previous.kind === s.kind && previous.version === s.version && !s.latest) {
+              s.latest = previous.latest;
+              s.updateAvailable = previous.updateAvailable;
+            }
+            renderRuntime(s);
+          } catch (e) {
+            $("aiRuntimeInfo").textContent = errText(e);
+            return;
+          }
+          await checkAiRuntimeUpdate();
+        }
+
+        // Best effort: the check needs the network, so a failure only leaves the update button hidden.
+        async function checkAiRuntimeUpdate() {
+          if (state.busy.runtime) return;
+          try {
+            renderRuntime(await M.invoke("check_ai_runtime_update"));
+          } catch (e) {
+            // Offline or PyPI unreachable: no update is offered.
+          }
+        }
+
+        async function updateAiRuntime() {
+          if (!state.runtime || state.busy.runtime) return;
+          if (!window.confirm("¿Actualizar el runtime MLX a la última versión? Se descargarán paquetes de Internet.")) return;
+          state.busy.runtime = true;
+          $("updateAiRuntime").disabled = true;
+          $("installAiRuntime").disabled = true;
+          $("aiRuntimeProgress").textContent = "";
+          try {
+            renderRuntime(await M.invoke("update_ai_runtime"));
+          } catch (e) {
+            showError("No se pudo actualizar el runtime: " + errText(e));
+          } finally {
+            state.busy.runtime = false;
+            $("updateAiRuntime").disabled = false;
+            $("installAiRuntime").disabled = false;
+          }
+          await refreshAiRuntime();
+        }
+
+        // Warns when the selected local model cannot run on the installed runtime. Only a line of text.
+        var compatRequest = 0;
+        async function refreshModelCompat() {
+          var node = $("aiModelCompat");
+          var request = ++compatRequest;
+          var model = installedModel();
+          setStatus(node, "", "error");
+          if (!model) return;
+          try {
+            var compat = await M.invoke("local_model_compatibility", { modelId: model.id });
+            if (request !== compatRequest) return;
+            if (compat && compat.supported === false) {
+              setStatus(node, compat.reason || "Este modelo no es compatible con el runtime instalado.", "error");
+            } else {
+              setStatus(node, "", "error");
+            }
+          } catch (e) {
+            if (request === compatRequest) setStatus(node, "No se pudo comprobar la compatibilidad: " + errText(e), "error");
+          }
+        }
+
+        async function testAiModel() {
+          if (state.busy.test) return;
+          state.busy.test = true;
+          var node = $("aiModelTest");
+          $("testAiModel").disabled = true;
+          setStatus(node, "Probando el modelo…", "");
+          try {
+            setStatus(node, String(await M.invoke("test_local_ai_model")), "ok");
+          } catch (e) {
+            setStatus(node, errText(e), "error");
+          } finally {
+            state.busy.test = false;
+            updateModelControls();
+          }
+          // A successful test may have started or stopped the server.
+          await refreshAiRuntime();
+        }
+
+        async function installAiRuntime() {
+          var s = state.runtime;
+          if (!s || state.busy.runtime) return;
+          if (!window.confirm("¿Instalar el runtime " + runtimeLabel(s.kind) + "? Teo descargará paquetes desde Internet.")) return;
+          state.busy.runtime = true;
+          $("installAiRuntime").disabled = true;
+          $("aiRuntimeProgress").textContent = "";
+          try {
+            renderRuntime(await M.invoke("install_ai_runtime", { confirmed: true }));
+          } catch (e) {
+            showError("No se pudo instalar el runtime: " + errText(e));
+          } finally {
+            state.busy.runtime = false;
+            $("installAiRuntime").disabled = false;
+          }
+        }
+
+        // ---------- AI: Hugging Face hub ----------
+
+        function renderHub(snapshot) {
+          var hub = (state.hub = snapshot || { phase: "idle" });
+          var phase = hub.phase;
+          var info = hub.inspection || null;
+          var canInstall = !!(info && info.canInstall);
+          var primary = $("hubPrimary");
+          var secondary = $("hubSecondary");
+          var urlFilled = $("hubUrl").value.trim() !== "";
+
+          $("hubUrl").disabled = !(phase === "idle" || phase === "failed");
+          $("hubDetail").hidden = !info;
+          if (info) {
+            var files = info.files || [];
+            // Tool-calling support is shown only when the backend reports it; an absent field is not "sin soporte".
+            var toolsLabel = info.format && typeof info.supportsTools === "boolean"
+              ? (info.supportsTools ? "soporta tools" : "sin soporte de tools")
+              : "";
+            $("hubTitle").textContent = info.repoId;
+            $("hubMeta").textContent = [
+              M.formatBytes(info.totalBytes),
+              files.length + " archivos",
+              info.format ? String(info.format).toUpperCase() : "formato no compatible",
+              toolsLabel,
+              info.quant,
+              suggestedText(info.suggestedConfig, false)
+            ].filter(Boolean).join(" · ");
+            var fit = FIT[info.fit] || FIT.tooBig;
+            $("hubFit").className = "ui-badge " + fit.cls;
+            $("hubFit").textContent = fit.label;
+            $("hubVerdict").textContent = info.verdict || "";
+            $("hubVerdict").className = "ui-status " + (canInstall ? fit.status : "ui-status--error");
+          }
+
+          var options = (info && info.ggufOptions) || [];
+          $("hubQuantRow").hidden = options.length === 0;
+          if (options.length) {
+            var nodes = [el("option", { value: "" }, "Elige una cuantización")];
+            options.forEach(function (o) {
+              nodes.push(el("option", { value: o.filename }, o.quant + " · " + M.formatBytes(o.sizeBytes)));
+            });
+            $("hubQuant").replaceChildren.apply($("hubQuant"), nodes);
+            var match = options.filter(function (o) { return o.quant === info.quant; })[0];
+            $("hubQuant").value = match ? match.filename : "";
+          }
+          $("hubQuant").disabled = !(phase === "idle" || phase === "failed" || phase === "ready");
+
+          var downloading = phase === "downloading";
+          $("hubProgressRow").hidden = !downloading;
+          if (downloading) {
+            var total = hub.total || 0;
+            var done = hub.downloaded || 0;
+            var pct = total > 0 ? Math.min(100, (done / total) * 100) : 0;
+            $("hubBar").style.width = pct.toFixed(1) + "%";
+            $("hubProgressText").textContent = total > 0
+              ? M.formatBytes(done) + " de " + M.formatBytes(total)
+              : "Conectando…";
+          }
+
+          if (phase === "failed") setStatus($("hubMessage"), hub.error || "La operación falló.", "error");
+          else if (phase === "done") setStatus($("hubMessage"), "Modelo instalado" + (info ? " en " + info.folder : "") + ". Ya aparece en la lista.", "ok");
+          else setStatus($("hubMessage"), "", "");
+
+          secondary.hidden = true;
+          primary.disabled = false;
+          switch (phase) {
+            case "inspecting":
+              primary.textContent = "Analizando…";
+              primary.disabled = true;
+              break;
+            case "ready":
+              primary.textContent = "Descargar";
+              primary.disabled = !canInstall;
+              secondary.textContent = "Descartar";
+              secondary.hidden = false;
+              break;
+            case "downloading":
+              primary.textContent = "Descargando…";
+              primary.disabled = true;
+              secondary.textContent = "Cancelar";
+              secondary.hidden = false;
+              break;
+            case "done":
+              primary.textContent = "Otro modelo";
+              break;
+            case "failed":
+              primary.textContent = canInstall ? "Reintentar descarga" : "Analizar";
+              primary.disabled = !canInstall && !urlFilled;
+              secondary.textContent = "Descartar";
+              secondary.hidden = false;
+              break;
+            default:
+              primary.textContent = "Analizar";
+              primary.disabled = !urlFilled;
+          }
+        }
+
+        async function syncHub() {
+          try {
+            renderHub(await M.invoke("model_hub_state"));
+          } catch (e) {
+            setStatus($("hubMessage"), errText(e), "error");
+          }
+        }
+
+        async function inspectHub(ggufFilename) {
+          var url = $("hubUrl").value.trim();
+          if (!url) {
+            setStatus($("hubMessage"), "Escribe una URL o usuario/modelo.", "error");
+            return;
+          }
+          await M.invoke("model_hub_inspect", { url: url, ggufFilename: ggufFilename || null });
+        }
+
+        async function hubPrimaryAction() {
+          var phase = state.hub.phase;
+          var info = state.hub.inspection;
+          var download = phase === "ready" || (phase === "failed" && !!(info && info.canInstall));
+          try {
+            if (download) {
+              await M.invoke("model_hub_download");
+            } else if (phase === "done") {
+              $("hubUrl").value = "";
+              renderHub(await M.invoke("model_hub_reset", { discard: false }));
+              return;
+            } else {
+              // A new analysis never reuses the previous repo's quant choice.
+              await inspectHub(null);
+            }
+          } catch (e) {
+            setStatus($("hubMessage"), errText(e), "error");
+          }
+          await syncHub();
+        }
+
+        async function hubSecondaryAction() {
+          try {
+            if (state.hub.phase === "downloading") {
+              renderHub(await M.invoke("model_hub_cancel"));
+            } else {
+              renderHub(await M.invoke("model_hub_reset", { discard: true }));
+            }
+          } catch (e) {
+            setStatus($("hubMessage"), errText(e), "error");
+          }
+        }
+
+        // ---------- Context and response limits ----------
+
+        function limitsError(ctx, out) {
+          if (!Number.isInteger(ctx) || ctx < CTX.min || ctx > CTX.max) {
+            return "El contexto debe estar entre 2048 y 131072 tokens.";
+          }
+          if (!Number.isInteger(out) || out < OUT.min || out > OUT.max) {
+            return "Los tokens de respuesta deben estar entre 128 y 16384.";
+          }
+          if (ctx - out < MIN_INPUT) {
+            return "La respuesta reservada deja muy poco espacio para la conversación.";
+          }
+          return "";
+        }
+
+        function setLimits(ctx, out) {
+          $("contextLimit").value = ctx;
+          $("contextLimitRange").value = ctx;
+          $("maxOutput").value = out;
+          $("maxOutputRange").value = out;
+          updateLimitsHint();
+        }
+
+        function updateLimitsHint() {
+          var ctx = parseNum("contextLimit");
+          var out = parseNum("maxOutput");
+          var problem = limitsError(ctx, out);
+          if (problem) {
+            $("limitsHint").textContent = problem;
+            return;
+          }
+          var text = "Quedan ~" + (ctx - out).toLocaleString("es") + " tokens para la conversación.";
+          var model = $("aiSourceLocal").checked ? installedModel() : null;
+          var cap = model && model.suggestedConfig ? model.suggestedConfig.maxContextTokens : null;
+          if ($("useHfRecommendedConfig").checked && known(cap) && ctx > cap) {
+            text += " El modelo admite hasta " + cap.toLocaleString("es") + " tokens; se ajustará automáticamente al ejecutar.";
+          }
+          $("limitsHint").textContent = text;
+        }
+
+        // ---------- Correction rules ----------
+
+        function renderRules() {
+          var list = $("ruleList");
+          var rows = state.rules.map(ruleRow);
+          list.replaceChildren.apply(list, [$("ruleHead")].concat(rows));
+          $("ruleEmpty").hidden = state.rules.length > 0;
+        }
+
+        function ruleRow(rule) {
+          return el("div", { class: "ui-rule-row" },
+            el("input", {
+              type: "text",
+              class: "ui-input",
+              value: rule.find,
+              placeholder: "Texto a buscar",
+              "aria-label": "Texto a buscar",
+              autocomplete: "off",
+              oninput: function (e) { rule.find = e.target.value; }
+            }),
+            el("input", {
+              type: "text",
+              class: "ui-input",
+              value: rule.replace,
+              placeholder: "Reemplazo (vacío borra)",
+              "aria-label": "Reemplazar por",
+              autocomplete: "off",
+              oninput: function (e) { rule.replace = e.target.value; }
+            }),
+            el("span", { class: "ui-actions" },
+              el("label", { class: "ui-switch-label", title: "Distinguir mayúsculas y minúsculas" },
+                el("span", { class: "ui-switch" },
+                  el("input", {
+                    type: "checkbox",
+                    role: "switch",
+                    checked: rule.caseSensitive,
+                    "aria-label": "Distinguir mayúsculas y minúsculas",
+                    onchange: function (e) { rule.caseSensitive = e.target.checked; }
+                  }),
+                  el("span")),
+                "Mayús."),
+              el("label", { class: "ui-switch-label", title: "Solo palabra completa" },
+                el("span", { class: "ui-switch" },
+                  el("input", {
+                    type: "checkbox",
+                    role: "switch",
+                    checked: rule.wholeWord,
+                    "aria-label": "Solo palabra completa",
+                    onchange: function (e) { rule.wholeWord = e.target.checked; }
+                  }),
+                  el("span")),
+                "Palabra completa"),
+              el("button", {
+                type: "button",
+                class: "ui-btn ui-btn--icon ui-btn--compact ui-btn--danger",
+                "aria-label": "Eliminar regla",
+                title: "Eliminar regla",
+                onclick: function () { removeRule(rule); }
+              }, "×")
+            )
+          );
+        }
+
+        function addRule() {
+          state.rules.push({ find: "", replace: "", caseSensitive: false, wholeWord: false });
+          renderRules();
+          var rows = $("ruleList").querySelectorAll(".ui-rule-row:not(.ui-rule-row--head)");
+          var last = rows[rows.length - 1];
+          if (last) last.querySelector("input").focus();
+        }
+
+        function removeRule(rule) {
+          var index = state.rules.indexOf(rule);
+          if (index >= 0) state.rules.splice(index, 1);
+          renderRules();
+        }
+
+        function collectRules() {
+          return state.rules.map(function (r) {
+            // The backend's CorrectionRule has no camelCase rename and reads case_sensitive /
+            // whole_word. The camelCase keys follow the settings contract. Serde ignores the key
+            // it does not know, so sending both is safe.
+            return {
+              find: r.find,
+              replace: r.replace,
+              caseSensitive: r.caseSensitive,
+              case_sensitive: r.caseSensitive,
+              wholeWord: r.wholeWord,
+              whole_word: r.wholeWord
+            };
+          });
+        }
+
+        // ---------- Save ----------
+
+        function validate() {
+          if (!$("outputDir").value.trim()) {
+            return { tab: "general", message: "Elige una carpeta de salida.", focus: $("pickOutputDir") };
+          }
+          var limitProblem = limitsError(parseNum("contextLimit"), parseNum("maxOutput"));
+          if (limitProblem) {
+            return { tab: "ai", message: limitProblem, focus: $("contextLimit") };
+          }
+          if (!$("useHfRecommendedConfig").checked) {
+            var sampling = samplingProblem();
+            if (sampling) return sampling;
+          }
+          var words = parseNum("minReportWords");
+          if (!Number.isInteger(words) || words < 0) {
+            return { tab: "corrections", message: "Las palabras mínimas deben ser un entero de 0 o más.", focus: $("minReportWords") };
+          }
+          if (state.view.platformOs === "macos") {
+            var sys = parseNum("macSystemGain");
+            var mic = parseNum("macMicrophoneGain");
+            if (!isFinite(sys) || sys < 0 || !isFinite(mic) || mic < 0) {
+              return { tab: "stt", message: "Las ganancias deben ser números de 0 o más.", focus: $("macSystemGain") };
+            }
+          }
+          if (state.view.platformOs === "windows") {
+            var buffer = parseNum("windowsBufferSeconds");
+            if (!isFinite(buffer) || buffer < 0.2) {
+              return { tab: "stt", message: "El buffer de Windows debe ser de al menos 0.2 segundos.", focus: $("windowsBufferSeconds") };
+            }
+          }
+          var emptyRule = state.rules.some(function (r) { return r.find === ""; });
+          if (emptyRule) {
+            return { tab: "corrections", message: "Hay una regla sin texto a buscar. Complétala o elimínala." };
+          }
+          return null;
+        }
+
+        async function saveSettings() {
+          if (state.busy.save) return;
+          if (!state.view) {
+            showError("Las preferencias aún no se han cargado; no se puede guardar.");
+            return;
+          }
+          var problem = validate();
+          if (problem) {
+            showTab(problem.tab);
+            showError(problem.message);
+            if (problem.focus) problem.focus.focus();
+            return;
+          }
+          state.busy.save = true;
+          $("saveSettings").disabled = true;
+          updateModelControls();
+          clearStatus();
+          try {
+            var view = await M.invoke("update_settings", { update: buildUpdate() });
+            render(view);
+            renderSessionSummary(view);
+            showSaved("Cambios guardados.");
+          } catch (e) {
+            showError("No se pudo guardar la configuración: " + errText(e));
+          } finally {
+            state.busy.save = false;
+            $("saveSettings").disabled = false;
+            updateModelControls();
+          }
+        }
+
+        // ---------- Analyze an existing note ----------
+
+        function renderAnalyze() {
+          var running = state.busy.analyze;
+          $("analyzePick").disabled = running;
+          $("analyzeRun").disabled = running || !state.analyzePath;
+        }
+
+        async function pickAnalyzeFile() {
+          if (state.busy.analyze) return;
+          var path;
+          try {
+            path = await M.invoke("pick_meeting_file");
+          } catch (e) {
+            setStatus($("analyzeStatus"), "No se pudo abrir el selector de archivos: " + errText(e), "error");
+            return;
+          }
+          // Cancelled: keep the current choice.
+          if (typeof path !== "string" || !path) return;
+          state.analyzePath = path;
+          $("analyzePath").value = path;
+          $("analyzePath").title = path;
+          $("analyzeOpen").hidden = true;
+          setStatus($("analyzeStatus"), "", "");
+          renderAnalyze();
+        }
+
+        async function runAnalyze() {
+          if (!state.analyzePath || state.busy.analyze) return;
+          state.busy.analyze = true;
+          $("analyzeOpen").hidden = true;
+          setStatus($("analyzeStatus"), "Analizando…", "");
+          renderAnalyze();
+          try {
+            await M.invoke("run_report_on_file", { path: state.analyzePath });
+            setStatus($("analyzeStatus"), "Informe generado.", "ok");
+            $("analyzeOpen").hidden = false;
+          } catch (e) {
+            setStatus($("analyzeStatus"), errText(e), "error");
+          } finally {
+            state.busy.analyze = false;
+            renderAnalyze();
+          }
+        }
+
+        async function openAnalyzedNote() {
+          if (!state.analyzePath) return;
+          try {
+            await M.invoke("open_note", { path: state.analyzePath });
+          } catch (e) {
+            setStatus($("analyzeStatus"), "No se pudo abrir la nota: " + errText(e), "error");
+          }
+        }
+
+        // ---------- Wiring ----------
+
+        document.querySelectorAll(".nav-item").forEach(function (item) {
+          item.addEventListener("click", function () { showTab(item.dataset.tab); });
+        });
+
+        $("primaryBtn").addEventListener("click", onPrimary);
+        $("openNoteBtn").addEventListener("click", openNote);
+        $("reanalyzeBtn").addEventListener("click", rerunAi);
+
+        $("analyzePick").addEventListener("click", pickAnalyzeFile);
+        $("analyzeRun").addEventListener("click", runAnalyze);
+        $("analyzeOpen").addEventListener("click", openAnalyzedNote);
+        M.listen("report-progress", function (event) {
+          var p = event.payload || {};
+          if (state.busy.analyze && p.message) setStatus($("analyzeStatus"), p.message, "");
+        });
+
+        $("pickOutputDir").addEventListener("click", async function () {
+          var dir = await pickDirectory("Carpeta de salida");
+          if (dir) $("outputDir").value = dir;
+        });
+        $("importLegacyEnv").addEventListener("click", importLegacyEnv);
+        $("theme").addEventListener("change", function (e) {
+          try { M.applyTheme(e.target.value); } catch (err) { showError(errText(err)); }
+        });
+
+        $("sttEngine").addEventListener("change", function () {
+          updateSttVisibility();
+          refreshStt();
+        });
+        $("whisperModel").addEventListener("change", refreshStt);
+        $("sttInstall").addEventListener("click", installStt);
+        M.listen("stt-provision-progress", function (event) {
+          var p = event.payload || {};
+          if (typeof p.percent === "number") {
+            $("sttProgress").classList.remove("ui-progress--indeterminate");
+            $("sttProgressBar").style.width = Math.max(0, Math.min(100, p.percent)) + "%";
+          } else {
+            // No percent (unknown length): slide the bar instead of showing a stale width.
+            $("sttProgress").classList.add("ui-progress--indeterminate");
+            $("sttProgressBar").style.width = "";
+          }
+          setStatus($("sttProgressText"), p.message || "", "");
+        });
+
+        $("aiEnabled").addEventListener("change", updateAiVisibility);
+        $("aiSourceLocal").addEventListener("change", updateAiVisibility);
+        $("aiSourceApi").addEventListener("change", updateAiVisibility);
+        $("aiModelId").addEventListener("change", function (e) {
+          state.modelId = e.target.value;
+          // A previous test result belongs to the previously selected model.
+          setStatus($("aiModelTest"), "", "");
+          updateModelControls();
+          refreshModelCompat();
+        });
+        $("testAiModel").addEventListener("click", testAiModel);
+        $("deleteAiModel").addEventListener("click", deleteAiModel);
+        $("useHfRecommendedConfig").addEventListener("change", function () {
+          updateSamplingVisibility();
+          updateLimitsHint();
+        });
+        $("pickAiModelsDir").addEventListener("click", async function () {
+          var dir = await pickDirectory("Carpeta de modelos de IA");
+          if (!dir) return;
+          state.modelsDir = dir;
+          state.modelsDirDirty = true;
+          showModelsDir();
+          refreshModels();
+        });
+        $("installAiRuntime").addEventListener("click", installAiRuntime);
+        $("updateAiRuntime").addEventListener("click", updateAiRuntime);
+        M.listen("ai-runtime-progress", function (event) {
+          $("aiRuntimeProgress").textContent = (event.payload && event.payload.message) || "";
+        });
+
+        $("hubUrl").addEventListener("input", function () { renderHub(state.hub); });
+        $("hubUrl").addEventListener("keydown", function (e) {
+          if (e.key === "Enter" && !$("hubPrimary").disabled) hubPrimaryAction();
+        });
+        $("hubPrimary").addEventListener("click", hubPrimaryAction);
+        $("hubSecondary").addEventListener("click", hubSecondaryAction);
+        $("hubQuant").addEventListener("change", async function () {
+          var filename = $("hubQuant").value;
+          if (!filename) return;
+          try {
+            await inspectHub(filename);
+          } catch (e) {
+            setStatus($("hubMessage"), errText(e), "error");
+          }
+        });
+        M.listen("model-hub-state", function (event) {
+          var previous = state.hub.phase;
+          renderHub(event.payload);
+          if (event.payload && event.payload.phase === "done" && previous !== "done") {
+            refreshModels();
+          }
+        });
+
+        [["contextLimit", "contextLimitRange"], ["maxOutput", "maxOutputRange"]].forEach(function (pair) {
+          var num = $(pair[0]);
+          var range = $(pair[1]);
+          range.addEventListener("input", function () { num.value = range.value; updateLimitsHint(); });
+          num.addEventListener("input", function () { range.value = num.value; updateLimitsHint(); });
+        });
+
+        $("addRule").addEventListener("click", addRule);
+        $("resetSkillPrompt").addEventListener("click", function () {
+          // Only fills the editor; the default is stored when the user saves.
+          $("reportSkillPrompt").value = (state.view && state.view.defaultReportSkillPrompt) || "";
+          setStatus($("settingsError"), "", "");
+          setStatus($("settingsSaved"), "Skill restablecida al valor predeterminado. Guarda los cambios para aplicarla.", "warn");
+        });
+        $("saveSettings").addEventListener("click", saveSettings);
+
+        M.listen("session-state", function (event) {
+          setSnapshot(event.payload);
+        }).catch(function () { /* outside Tauri the listener is a no-op */ });
+        // The tray asks for a tab: "session" or "general".
+        M.listen("navigate-tab", function (event) {
+          var tab = event.payload;
+          if (tab === "session" || tab === "general") showTab(tab);
+        }).catch(function () { /* outside Tauri the listener is a no-op */ });
+        setInterval(renderTimer, 1000);
+
+        // ---------- Load ----------
+
+        showTab("session");
+        renderSession();
+        (async function load() {
+          try {
+            var view = await M.invoke("get_settings");
+            render(view);
+            renderSessionSummary(view);
+          } catch (e) {
+            showError("No se pudieron cargar las preferencias: " + errText(e));
+          }
+          try {
+            renderHub(await M.invoke("model_hub_state"));
+          } catch (e) {
+            renderHub(null);
+          }
+          try {
+            setSnapshot(await M.invoke("session_state"));
+          } catch (e) {
+            showActionError("No se pudo leer el estado de la sesión: " + errText(e));
+          }
+        })();
+      })();
+    </script>
+  </body>
+</html>
