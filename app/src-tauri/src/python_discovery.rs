@@ -718,7 +718,6 @@ mod tests {
         assert_eq!(launchers.len(), 2);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_launcher_that_resolves_to_the_store_package_is_rejected() {
         let candidates = vec![
@@ -746,6 +745,7 @@ mod tests {
         assert_eq!(selected.executable, PathBuf::from("/usr/local/bin/python3.12"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn deduplicates_symlink_aliases_to_the_same_interpreter() {
         let scratch = tempfile::tempdir().unwrap();
