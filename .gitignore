@@ -24,3 +24,6 @@ outputs/
 # Rust / Tauri build output
 /target/
 app/src-tauri/gen/
+
+# Instaladores descargados de CI
+installers-windows/
