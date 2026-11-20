@@ -140,8 +140,8 @@ impl Default for AppSettings {
             ai_top_p: None,
             ai_top_k: None,
             ai_repetition_penalty: None,
-            context_limit_tokens: 32768,
-            max_output_tokens: 4096,
+            context_limit_tokens: 16384,
+            max_output_tokens: 2560,
             min_report_words: 50,
             replace_existing_report: true,
             corrections: Vec::new(),
@@ -328,8 +328,8 @@ mod tests {
         assert_eq!(s.ai_endpoint, "http://127.0.0.1:8080/v1");
         assert_eq!(s.ai_model_name, "");
         assert_eq!(s.ai_api_key, "");
-        assert_eq!(s.context_limit_tokens, 32768);
-        assert_eq!(s.max_output_tokens, 4096);
+        assert_eq!(s.context_limit_tokens, 16384);
+        assert_eq!(s.max_output_tokens, 2560);
         assert_eq!(s.min_report_words, 50);
         assert!(s.replace_existing_report);
         assert!(s.corrections.is_empty());

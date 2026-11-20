@@ -13,9 +13,9 @@ use mt_core::{
 };
 use serde_json::{Value, json};
 
-use crate::budget::{chunk_transcript, estimate_messages_tokens};
+use crate::budget::{chunk_transcript, estimate_messages_tokens, max_bytes_for_tokens};
 use crate::error::AiError;
-use crate::provider::OpenAiCompatibleProvider;
+use crate::provider::{ChatMessage, OpenAiCompatibleProvider};
 use crate::tool_calls_text::parse_tool_calls;
 
 /// Transcripts with fewer spoken words than this skip the model entirely.
@@ -65,9 +65,42 @@ block, then wait for the result:\n\
     )
 }
 
+/// OpenAI function tool that saves the final meeting report.
+fn save_report_tool() -> Value {
+    let section = |description: &str| json!({ "type": "string", "description": description });
+    json!({
+        "type": "function",
+        "function": {
+            "name": SAVE_REPORT_TOOL_NAME,
+            "description": "Saves the final meeting report. Every argument is rich Markdown text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "executive_summary": section("1-2 clear narrative paragraphs covering purpose, participants, main topics/workflows, decisions, and next steps."),
+                    "key_decisions": section("Explicit decisions and agreements with their reason/context when discussed."),
+                    "topics_and_discussion": section("Chronological topic chapters (### Title — HH:MM:SS) with substantive explanations, including step-by-step workflows/processes discussed."),
+                    "action_items": section("Detailed checklist items (- [ ] ...) with owner, specific task, priority/status if stated, due date, and timestamp if available."),
+                    "key_questions": section("Material questions with their answer (or Open/Partially resolved status) and why they matter."),
+                    "open_issues": section("Unresolved problems, bugs, blockers, or risks with impact and next step when stated."),
+                    "important_facts": section("Exact dates, deadlines, rules, laws, endpoints, environments, limits, numbers, and technical constraints.")
+                },
+                "required": [
+                    "executive_summary",
+                    "key_decisions",
+                    "topics_and_discussion",
+                    "action_items",
+                    "key_questions",
+                    "open_issues",
+                    "important_facts"
+                ],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
 /// OpenAI function tools for the report flow.
 pub fn meeting_tools() -> Vec<Value> {
-    let section = |description: &str| json!({ "type": "string", "description": description });
     vec![
         json!({
             "type": "function",
@@ -92,35 +125,7 @@ pub fn meeting_tools() -> Vec<Value> {
                 }
             }
         }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": SAVE_REPORT_TOOL_NAME,
-                "description": "Saves the final meeting report. Every argument is rich Markdown text.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "executive_summary": section("1-2 clear narrative paragraphs covering purpose, participants, main topics/workflows, decisions, and next steps."),
-                        "key_decisions": section("Explicit decisions and agreements with their reason/context when discussed."),
-                        "topics_and_discussion": section("Chronological topic chapters (### Title — HH:MM:SS) with substantive explanations, including step-by-step workflows/processes discussed."),
-                        "action_items": section("Detailed checklist items (- [ ] ...) with owner, specific task, priority/status if stated, due date, and timestamp if available."),
-                        "key_questions": section("Material questions with their answer (or Open/Partially resolved status) and why they matter."),
-                        "open_issues": section("Unresolved problems, bugs, blockers, or risks with impact and next step when stated."),
-                        "important_facts": section("Exact dates, deadlines, rules, laws, endpoints, environments, limits, numbers, and technical constraints.")
-                    },
-                    "required": [
-                        "executive_summary",
-                        "key_decisions",
-                        "topics_and_discussion",
-                        "action_items",
-                        "key_questions",
-                        "open_issues",
-                        "important_facts"
-                    ],
-                    "additionalProperties": false
-                }
-            }
-        }),
+        save_report_tool(),
     ]
 }
 
@@ -248,7 +253,37 @@ fn role_of(message: Option<&Value>) -> Option<&str> {
     message?.get("role")?.as_str()
 }
 
+fn map_system_prompt(output_language: &str) -> String {
+    format!(
+        "You extract factual meeting notes from one transcript chunk. \
+Write concise structured notes in {output_language} covering only what this chunk states:\n\
+- Participants, date/time if mentioned\n\
+- Topics and step-by-step workflows/processes (trigger, steps, rules, conditions, exceptions, systems)\n\
+- Explicit decisions/agreements (with reason if stated)\n\
+- Action items (owner or Not specified, task, priority/status if stated, due date, timestamp [HH:MM:SS] if present)\n\
+- Key questions (with answer if resolved here, or Open)\n\
+- Open issues, bugs, blockers, or risks (with impact/next step if stated)\n\
+- Important facts (dates, numbers, limits, endpoints, environments, laws, systems)\n\
+Never invent information. Keep speaker labels and timestamps."
+    )
+}
+
+fn reduce_system_prompt(output_language: &str) -> String {
+    format!(
+        "You are meeting-report-analyst. Synthesize the chunk notes into the final meeting report \
+by calling save_meeting_report once.\n\
+Rules: follow the SKILL instructions; write all report content in OUTPUT_LANGUAGE = {output_language}; \
+merge repeated topics across chunks; prefer later clarifications, answers, and final agreed positions; \
+preserve step-by-step workflows/processes and narrative executive summary; never invent facts.\n\
+Deliver the report ONLY by calling save_meeting_report."
+    )
+}
+
 /// Analyzes the transcript and returns the report sections.
+///
+/// Single-chunk transcripts use the proven single-pass tool loop; multi-chunk transcripts use
+/// map-reduce (one tool-free note-taking request per chunk, then one reduce request calling
+/// `save_meeting_report`) so no request re-sends an ever-growing transcript history.
 pub async fn analyze_transcript(
     provider: &OpenAiCompatibleProvider,
     transcript: &str,
@@ -287,6 +322,159 @@ for every chunk 0..last, then save_meeting_report."
         output_language: output_language.to_string(),
         chunks: chunk_transcript(&working, chunk_budget),
     };
+
+    if context.chunks.len() > 1 {
+        return analyze_multi_chunk_map_reduce(provider, &context, input_budget).await;
+    }
+
+    analyze_single_chunk(
+        provider,
+        &context,
+        &system,
+        &first_user,
+        &tools,
+        &tool_choice,
+        input_budget,
+        tools_overhead,
+    )
+    .await
+}
+
+async fn analyze_multi_chunk_map_reduce(
+    provider: &OpenAiCompatibleProvider,
+    context: &ReportContext,
+    input_budget: usize,
+) -> Result<MarkdownSections, AiError> {
+    let map_system = map_system_prompt(&context.output_language);
+    let total = context.chunks.len();
+    let mut notes = Vec::with_capacity(total);
+    for (idx, chunk) in context.chunks.iter().enumerate() {
+        let user = format!("Chunk {} of {}:\n\n{}", idx + 1, total, chunk);
+        let reply = provider
+            .chat_complete(&[
+                ChatMessage::system(map_system.clone()),
+                ChatMessage::user(user),
+            ])
+            .await?;
+        let trimmed = reply.trim();
+        if !trimmed.is_empty() {
+            notes.push(format!("### Chunk {}/{}\n{}", idx + 1, total, trimmed));
+        }
+    }
+
+    let tools = vec![save_report_tool()];
+    let tool_choice = json!("auto");
+    let tools_text = serde_json::to_string(&tools).unwrap_or_default();
+    let choice_text = tool_choice.to_string();
+    let reduce_system = reduce_system_prompt(&context.output_language);
+    let prefix = format!(
+        "OUTPUT_LANGUAGE = {}\n\nSKILL:\n{}\n\nCHUNK NOTES:\n",
+        context.output_language, context.skill
+    );
+    let fixed_tokens = estimate_messages_tokens([
+        reduce_system.as_str(),
+        prefix.as_str(),
+        tools_text.as_str(),
+        choice_text.as_str(),
+    ]) + ROUNDING_SLACK_TOKENS;
+    let notes_budget_bytes =
+        max_bytes_for_tokens(input_budget.saturating_sub(fixed_tokens).max(256));
+
+    let mut combined_notes = notes.join("\n\n");
+    if combined_notes.len() > notes_budget_bytes && !notes.is_empty() {
+        let per_note_chars = (notes_budget_bytes / notes.len()).saturating_sub(16).max(120);
+        combined_notes = notes
+            .iter()
+            .map(|note| clip(note, per_note_chars))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    }
+
+    let mut history = vec![
+        json!({ "role": "system", "content": reduce_system }),
+        json!({ "role": "user", "content": format!("{prefix}{combined_notes}") }),
+    ];
+    let allowed = [SAVE_REPORT_TOOL_NAME];
+    let mut nudged = false;
+    let mut save_retried = false;
+    let mut gathered: Option<MarkdownSections> = None;
+    let mut last_error: Option<String> = None;
+
+    for _round in 0..3 {
+        let reply = provider
+            .chat_with_tools(&history, &tools, tool_choice.clone())
+            .await?;
+
+        let native = reply.tool_calls();
+        if let Some(call) = native.iter().find(|c| call_name(c) == SAVE_REPORT_TOOL_NAME) {
+            let sections = sections_from_args(&call_arguments(call));
+            if sections.is_empty() && !save_retried {
+                save_retried = true;
+                history.push(reply.message.clone());
+                history.push(json!({
+                    "role": "user",
+                    "content": "(system: save_meeting_report arrived empty. Call it again with the seven sections filled from the chunk notes.)",
+                }));
+                continue;
+            }
+            if sections.is_empty() {
+                last_error = Some(NO_REPORT_MESSAGE.to_string());
+            } else {
+                gathered = Some(sections);
+            }
+            break;
+        }
+
+        let parsed = parse_tool_calls(reply.content(), &allowed);
+        if let Some(call) = parsed.calls.iter().find(|c| c.name == SAVE_REPORT_TOOL_NAME) {
+            let sections = sections_from_args(&call.arguments);
+            if sections.is_empty() && !save_retried {
+                save_retried = true;
+                history.push(json!({
+                    "role": "user",
+                    "content": "(system: save_meeting_report arrived empty. Call it again with the seven sections filled from the chunk notes.)",
+                }));
+                continue;
+            }
+            if sections.is_empty() {
+                last_error = Some(NO_REPORT_MESSAGE.to_string());
+            } else {
+                gathered = Some(sections);
+            }
+            break;
+        }
+
+        if !nudged {
+            nudged = true;
+            history.push(json!({
+                "role": "user",
+                "content": "(system: call save_meeting_report now with the report.)",
+            }));
+            continue;
+        }
+        last_error = Some(NO_REPORT_MESSAGE.to_string());
+        break;
+    }
+
+    match gathered {
+        Some(sections) if !sections.is_empty() => Ok(sections),
+        _ => Err(AiError::InvalidResponse(
+            last_error.unwrap_or_else(|| NO_REPORT_MESSAGE.to_string()),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn analyze_single_chunk(
+    provider: &OpenAiCompatibleProvider,
+    context: &ReportContext,
+    system: &str,
+    first_user: &str,
+    tools: &[Value],
+    tool_choice: &Value,
+    input_budget: usize,
+    tools_overhead: usize,
+) -> Result<MarkdownSections, AiError> {
     let history_budget = input_budget.saturating_sub(tools_overhead);
     let max_rounds = (context.chunks.len() + 8).clamp(MAX_ROUNDS, MAX_ROUND_CAP);
 
@@ -303,7 +491,7 @@ for every chunk 0..last, then save_meeting_report."
     for _round in 0..max_rounds {
         trim_history(&mut history, history_budget);
         let reply = provider
-            .chat_with_tools(&history, &tools, tool_choice.clone())
+            .chat_with_tools(&history, tools, tool_choice.clone())
             .await?;
 
         let native = reply.tool_calls();
@@ -416,8 +604,8 @@ mod tests {
         OpenAiCompatibleProvider::new(ModelConfig {
             endpoint: format!("{}/v1", server.uri()),
             model: "m".to_string(),
-            context_limit_tokens: 32768,
-            max_output_tokens: 4096,
+            context_limit_tokens: 16384,
+            max_output_tokens: 2560,
             ..ModelConfig::default()
         })
         .expect("provider")
@@ -668,23 +856,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn long_transcript_chunks_are_never_truncated_and_all_chunks_can_be_read() {
-        // ~24,000 chars: previously packed into 1 chunk and silently clipped at 6,000 chars.
-        let long_meeting = (0..300)
-            .map(|i| format!("[15:{:02}:00] Turno {i}: explicacion detallada del flujo de base completa y predictivo.", i % 60))
+    async fn three_chunk_transcript_uses_three_map_requests_and_one_reduce_request_within_budget() {
+        // ~18,000 chars -> 3 chunks at MAX_CHUNK_TOKENS = 2_500 (~7,500 bytes/chunk).
+        let long_meeting = (0..220)
+            .map(|i| {
+                format!(
+                    "[15:{:02}:00] Turno {i}: explicacion detallada del flujo de base completa y predictivo.",
+                    i % 60
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(long_meeting.len() > 20_000);
+        let expected_chunks = chunk_transcript(&compact_transcript_for_analysis(&long_meeting), MAX_CHUNK_TOKENS);
+        assert_eq!(expected_chunks.len(), 3, "test fixture must produce 3 chunks");
 
         let server = MockServer::start().await;
         let seen_requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
         let seen_clone = Arc::clone(&seen_requests);
+        let budget = provider(&server).config().input_budget_tokens();
 
-        // Dynamic responder: reads context, then reads every chunk 0..N, then saves.
-        struct MultiChunkResponder {
+        struct MapReduceResponder {
             seen: Arc<std::sync::Mutex<Vec<Value>>>,
+            budget: usize,
         }
-        impl Respond for MultiChunkResponder {
+        impl Respond for MapReduceResponder {
             fn respond(&self, request: &Request) -> ResponseTemplate {
                 let body: Value = serde_json::from_slice(&request.body).unwrap();
                 let mut guard = self.seen.lock().unwrap();
@@ -692,49 +887,54 @@ mod tests {
                 guard.push(body.clone());
                 drop(guard);
 
-                if step == 0 {
-                    return ResponseTemplate::new(200)
-                        .set_body_json(tool_reply(READ_CONTEXT_TOOL_NAME, json!({})));
-                }
+                // Verify no request exceeds the input budget.
                 let messages = body["messages"].as_array().unwrap();
-                let last_tool = messages
-                    .iter()
-                    .rev()
-                    .find(|m| m["role"] == "tool")
-                    .and_then(|m| m["content"].as_str())
-                    .unwrap_or("");
+                let msg_tokens = estimate_messages_tokens(
+                    messages.iter().filter_map(|m| m["content"].as_str()),
+                );
+                let tools_tokens = body
+                    .get("tools")
+                    .map(|t| estimate_messages_tokens([t.to_string().as_str()]))
+                    .unwrap_or(0);
                 assert!(
-                    !last_tool.contains("[truncated]"),
-                    "tool result was truncated at step {step}: {last_tool}"
+                    msg_tokens + tools_tokens <= self.budget,
+                    "request {step} exceeded budget: {} > {}",
+                    msg_tokens + tools_tokens,
+                    self.budget
                 );
 
-                if step == 1 {
-                    // Parse "Chunks: N" from read_meeting_context output.
-                    let chunks_line = last_tool
-                        .lines()
-                        .find(|l| l.starts_with("Chunks: "))
-                        .expect("Chunks line");
-                    let count: usize = chunks_line.trim_start_matches("Chunks: ").parse().unwrap();
-                    assert!(count >= 2, "expected multiple chunks for 24KB transcript, got {count}");
-                    return ResponseTemplate::new(200)
-                        .set_body_json(tool_reply(READ_TRANSCRIPT_TOOL_NAME, json!({ "chunk": 0 })));
+                if step < 3 {
+                    // Map requests must be tool-free.
+                    assert!(
+                        body.get("tools").is_none(),
+                        "map request {step} should not send tools"
+                    );
+                    return ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": format!("Notas del bloque {}: flujo predictivo y base completa.", step + 1)
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    }));
                 }
 
-                // Check which chunk was just returned: "chunk X of Y:"
-                let header = last_tool.lines().next().unwrap_or("");
-                if let Some(rest) = header.strip_prefix("chunk ") {
-                    let parts: Vec<&str> = rest.trim_end_matches(':').split(" of ").collect();
-                    let idx: usize = parts[0].parse().unwrap();
-                    let last: usize = parts[1].parse().unwrap();
-                    if idx < last {
-                        return ResponseTemplate::new(200).set_body_json(tool_reply(
-                            READ_TRANSCRIPT_TOOL_NAME,
-                            json!({ "chunk": idx + 1 }),
-                        ));
-                    }
+                // Reduce request (step == 3) must carry tools and call save_meeting_report.
+                assert!(body.get("tools").is_some(), "reduce request must send tools");
+                let user_text = messages
+                    .iter()
+                    .filter_map(|m| m["content"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for idx in 1..=3 {
+                    assert!(
+                        user_text.contains(&format!("Notas del bloque {idx}")),
+                        "reduce request missing map notes {idx}"
+                    );
                 }
-
-                let long_topics = "### Flujo de base completa\n\n".to_string() + &"Detalle del flujo. ".repeat(300);
+                let long_topics = "### Flujo de base completa\n\n".to_string()
+                    + &"Detalle del flujo. ".repeat(300);
                 ResponseTemplate::new(200).set_body_json(tool_reply(
                     SAVE_REPORT_TOOL_NAME,
                     json!({
@@ -747,7 +947,10 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(MultiChunkResponder { seen: seen_clone })
+            .respond_with(MapReduceResponder {
+                seen: seen_clone,
+                budget,
+            })
             .mount(&server)
             .await;
 
@@ -755,12 +958,34 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(seen_requests.lock().unwrap().len(), 4, "expected 3 map + 1 reduce");
         assert_eq!(sections.executive_summary, "Resumen narrativo completo.");
         assert!(
             sections.topics_and_discussion.len() > 4_500,
             "topics_and_discussion should not be clipped at 4000 chars, got {}",
             sections.topics_and_discussion.len()
         );
+    }
+
+    #[tokio::test]
+    async fn single_chunk_transcript_keeps_single_pass_tool_loop() {
+        let server = MockServer::start().await;
+        let seen = serve(
+            &server,
+            vec![
+                tool_reply(READ_CONTEXT_TOOL_NAME, json!({})),
+                tool_reply(READ_TRANSCRIPT_TOOL_NAME, json!({ "chunk": 0 })),
+                tool_reply(SAVE_REPORT_TOOL_NAME, json!({ "executive_summary": "Resumen único." })),
+            ],
+        )
+        .await;
+
+        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", "")
+            .await
+            .unwrap();
+
+        assert_eq!(sections.executive_summary, "Resumen único.");
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

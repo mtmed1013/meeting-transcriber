@@ -254,6 +254,10 @@ async fn generate_ai_report(
     ))
 }
 
+/// Local loopback server request timeout in seconds (CPU inference on long meetings can take
+/// several minutes per request).
+const LOCAL_REQUEST_TIMEOUT_SECONDS: u64 = 600;
+
 /// Connection settings for the remote endpoint the user configured.
 fn api_model_config(settings: &AppSettings) -> Result<ModelConfig, String> {
     let endpoint = settings.ai_endpoint.trim();
@@ -319,6 +323,7 @@ fn local_model_config(
         presence_penalty,
         context_limit_tokens,
         max_output_tokens,
+        timeout_seconds: LOCAL_REQUEST_TIMEOUT_SECONDS,
         thinking: suggested.supports_thinking_toggle && !settings.ai_disable_thinking,
         ..ModelConfig::default()
     }
@@ -1161,6 +1166,15 @@ mod tests {
         assert_eq!(config.endpoint, "http://127.0.0.1:9000/v1");
         assert_eq!(config.model, "/models/whisper-mlx");
         assert!(config.api_key.is_empty());
+        assert_eq!(config.timeout_seconds, 600);
+
+        let api_settings = AppSettings {
+            ai_endpoint: "https://api.example.com/v1".to_string(),
+            ai_model_name: "gpt-4o-mini".to_string(),
+            ..AppSettings::default()
+        };
+        let api_config = api_model_config(&api_settings).unwrap();
+        assert_eq!(api_config.timeout_seconds, 120);
     }
 
     fn hf_settings() -> AppSettings {
@@ -1209,13 +1223,13 @@ mod tests {
             use_hf_recommended_config: false,
             ..hf_settings()
         };
-        assert_eq!(effective_context_tokens(&manual, &suggested), 32768, "manual mode ignores the profile");
+        assert_eq!(effective_context_tokens(&manual, &suggested), 16384, "manual mode ignores the profile");
 
         let unknown = SuggestedModelConfig {
             max_context_tokens: None,
             ..hf_suggestion()
         };
-        assert_eq!(effective_context_tokens(&hf_settings(), &unknown), 32768);
+        assert_eq!(effective_context_tokens(&hf_settings(), &unknown), 16384);
     }
 
     #[test]
@@ -1233,7 +1247,7 @@ mod tests {
         assert_eq!(config.repetition_penalty, Some(1.05));
         assert_eq!(config.presence_penalty, Some(1.5));
         assert_eq!(config.context_limit_tokens, 8192);
-        assert_eq!(config.max_output_tokens, 4096, "a reply reservation that fits is kept");
+        assert_eq!(config.max_output_tokens, 2560, "a reply reservation that fits is kept");
         assert!(!config.thinking, "ai_disable_thinking turns thinking off");
     }
 
@@ -1269,7 +1283,7 @@ mod tests {
         assert_eq!(config.top_k, Some(40));
         assert_eq!(config.repetition_penalty, Some(1.1));
         assert_eq!(config.presence_penalty, None, "there is no manual presence penalty");
-        assert_eq!(config.context_limit_tokens, 32768, "the profile does not clamp the context");
+        assert_eq!(config.context_limit_tokens, 16384, "the profile does not clamp the context");
         assert!(!config.thinking);
 
         let unset = AppSettings {

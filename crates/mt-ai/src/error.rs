@@ -11,9 +11,12 @@ pub enum AiError {
         estimated_tokens: usize,
         budget_tokens: usize,
     },
-    /// The configured endpoint is invalid or cannot be reached (connection refused, timeout).
+    /// The configured endpoint is invalid or cannot be reached (connection refused, DNS failure).
     #[error("endpoint de IA no disponible: {0}")]
     EndpointUnreachable(String),
+    /// The model did not finish responding within the configured request timeout.
+    #[error("el modelo tardó más de {seconds} s en responder (reduce el contexto, usa un modelo más liviano o aumenta el tiempo de espera): {detail}")]
+    Timeout { seconds: u64, detail: String },
     /// The endpoint answered with an error status or the request could not be completed.
     #[error("la solicitud al modelo falló: {0}")]
     RequestFailed(String),

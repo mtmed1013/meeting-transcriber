@@ -14,7 +14,7 @@ pub fn estimate_messages_tokens<'a>(contents: impl IntoIterator<Item = &'a str>)
 }
 
 /// Largest byte length whose [`estimate_tokens`] is at most `tokens`.
-fn max_bytes_for_tokens(tokens: usize) -> usize {
+pub(crate) fn max_bytes_for_tokens(tokens: usize) -> usize {
     // len / 3 + 1 <= tokens  <=>  len <= 3 * (tokens - 1) + 2
     match tokens.checked_sub(1) {
         None => 0,

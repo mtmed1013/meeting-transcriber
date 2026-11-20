@@ -54,8 +54,8 @@ impl Default for ModelConfig {
             top_k: None,
             repetition_penalty: None,
             presence_penalty: None,
-            context_limit_tokens: 32768,
-            max_output_tokens: 4096,
+            context_limit_tokens: 16384,
+            max_output_tokens: 2560,
             thinking: false,
             supports_thinking_toggle: false,
         }
@@ -158,12 +158,18 @@ impl OpenAiCompatibleProvider {
     pub fn new(config: ModelConfig) -> Result<Self, AiError> {
         let parsed = url::Url::parse(&config.endpoint)
             .map_err(|err| AiError::EndpointUnreachable(format!("endpoint inválido: {err}")))?;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(config.timeout_seconds.max(1)))
+        let loopback = is_loopback_host(parsed.host_str());
+        let timeout_seconds = config.timeout_seconds.max(1);
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_seconds));
+        if loopback {
+            builder = builder.no_proxy();
+        }
+        let client = builder
             .build()
-            .map_err(map_reqwest_error)?;
+            .map_err(|err| map_reqwest_error(err, timeout_seconds))?;
         Ok(Self {
-            loopback: is_loopback_host(parsed.host_str()),
+            loopback,
             completions_url: format!("{}/chat/completions", config.endpoint.trim_end_matches('/')),
             config,
             client,
@@ -262,13 +268,20 @@ impl OpenAiCompatibleProvider {
 
     /// POSTs `body` to the completions URL and returns the response text of a successful reply.
     async fn post_completion(&self, body: &Value) -> Result<String, AiError> {
+        let timeout_seconds = self.config.timeout_seconds.max(1);
         let mut request = self.client.post(&self.completions_url).json(body);
         if !self.config.api_key.is_empty() {
             request = request.bearer_auth(&self.config.api_key);
         }
-        let response = request.send().await.map_err(map_reqwest_error)?;
+        let response = request
+            .send()
+            .await
+            .map_err(|err| map_reqwest_error(err, timeout_seconds))?;
         let status = response.status();
-        let text = response.text().await.map_err(map_reqwest_error)?;
+        let text = response
+            .text()
+            .await
+            .map_err(|err| map_reqwest_error(err, timeout_seconds))?;
         if !status.is_success() {
             let snippet: String = text.chars().take(300).collect();
             return Err(AiError::RequestFailed(format!("HTTP {}: {snippet}", status.as_u16())));
@@ -288,8 +301,13 @@ fn is_loopback_host(host: Option<&str>) -> bool {
     )
 }
 
-fn map_reqwest_error(err: reqwest::Error) -> AiError {
-    if err.is_connect() || err.is_timeout() {
+fn map_reqwest_error(err: reqwest::Error, timeout_seconds: u64) -> AiError {
+    if err.is_timeout() {
+        AiError::Timeout {
+            seconds: timeout_seconds,
+            detail: err.to_string(),
+        }
+    } else if err.is_connect() {
         AiError::EndpointUnreachable(err.to_string())
     } else {
         AiError::RequestFailed(err.to_string())
@@ -452,7 +470,7 @@ mod tests {
         assert!(remote.get("chat_template_kwargs").is_none(), "{remote}");
         assert_eq!(remote["model"], "m");
         assert_eq!(remote["stream"], false);
-        assert_eq!(remote["max_tokens"], 4096);
+        assert_eq!(remote["max_tokens"], 2560);
         assert_eq!(remote["messages"][0], json!({ "role": "user", "content": "hola" }));
     }
 
@@ -647,6 +665,33 @@ mod tests {
         assert!(matches!(err, AiError::EndpointUnreachable(_)), "{err:?}");
     }
 
+    #[tokio::test]
+    async fn delayed_server_returns_timeout_error_not_endpoint_unreachable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "choices": [{ "message": { "content": "tarde" } }] }))
+                    .set_delay(Duration::from_secs(2)),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatibleProvider::new(ModelConfig {
+            timeout_seconds: 1,
+            ..config_for(&server)
+        })
+        .unwrap();
+        let err = provider.chat_complete(&[ChatMessage::user("hola")]).await.unwrap_err();
+        assert!(
+            matches!(err, AiError::Timeout { seconds: 1, .. }),
+            "expected Timeout, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("1 s"), "{msg}");
+        assert!(!msg.contains("no disponible"), "{msg}");
+    }
+
     fn save_report_tool() -> serde_json::Value {
         json!({"type": "function", "function": {"name": "save_meeting_report", "parameters": {"type": "object"}}})
     }
@@ -671,7 +716,7 @@ mod tests {
         let remote = tools_request_body(&config, &messages, &tools, choice, false);
         assert!(remote.get("chat_template_kwargs").is_none(), "{remote}");
         assert_eq!(remote["stream"], false);
-        assert_eq!(remote["max_tokens"], 4096);
+        assert_eq!(remote["max_tokens"], 2560);
     }
 
     #[tokio::test]
