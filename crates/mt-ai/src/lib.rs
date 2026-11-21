@@ -11,6 +11,8 @@ pub mod tool_calls_text;
 
 pub use budget::{chunk_transcript, estimate_messages_tokens, estimate_tokens};
 pub use error::AiError;
-pub use light_analyst::{MIN_SPOKEN_WORDS, analyze_transcript, meets_word_threshold};
+pub use light_analyst::{
+    AnalysisProgress, MIN_SPOKEN_WORDS, ProgressCallback, analyze_transcript, meets_word_threshold,
+};
 pub use provider::{ChatMessage, ChatRole, ModelConfig, OpenAiCompatibleProvider};
 pub use tool_calls_text::{ParsedCall, ParsedCalls, parse_tool_calls};

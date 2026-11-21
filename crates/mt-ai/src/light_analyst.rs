@@ -27,6 +27,44 @@ pub const READ_CONTEXT_TOOL_NAME: &str = "read_meeting_context";
 /// Tool that pages through the transcript.
 pub const READ_TRANSCRIPT_TOOL_NAME: &str = "read_transcript";
 
+/// Deterministic progress update emitted by [`analyze_transcript`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalysisProgress {
+    /// Monotonic percentage in `0..=100`, reaching `100` when the report sections are ready.
+    pub percent: u8,
+    /// Short Spanish status message describing the current unit.
+    pub message: String,
+}
+
+/// Thread-safe callback invoked as analysis units complete.
+pub type ProgressCallback<'a> = &'a (dyn Fn(AnalysisProgress) + Send + Sync);
+
+/// Enforces monotonic non-decreasing percentages in `0..=100` across a single analysis run.
+struct ProgressTracker<'a> {
+    callback: Option<ProgressCallback<'a>>,
+    last_percent: u8,
+}
+
+impl<'a> ProgressTracker<'a> {
+    fn new(callback: Option<ProgressCallback<'a>>) -> Self {
+        Self {
+            callback,
+            last_percent: 0,
+        }
+    }
+
+    fn emit(&mut self, percent: u8, message: impl Into<String>) {
+        let clamped = percent.min(100).max(self.last_percent);
+        self.last_percent = clamped;
+        if let Some(cb) = self.callback {
+            cb(AnalysisProgress {
+                percent: clamped,
+                message: message.into(),
+            });
+        }
+    }
+}
+
 const MAX_ROUNDS: usize = 12;
 const MAX_ROUND_CAP: usize = 40;
 /// Maximum tokens per transcript chunk (~7.5 KB), keeping every chunk well below
@@ -289,6 +327,7 @@ pub async fn analyze_transcript(
     transcript: &str,
     output_language: &str,
     skill_prompt: &str,
+    on_progress: Option<ProgressCallback<'_>>,
 ) -> Result<MarkdownSections, AiError> {
     let cleaned = clean_transcript(transcript);
     if count_spoken_words(&cleaned) < MIN_SPOKEN_WORDS {
@@ -322,9 +361,11 @@ for every chunk 0..last, then save_meeting_report."
         output_language: output_language.to_string(),
         chunks: chunk_transcript(&working, chunk_budget),
     };
+    let mut progress = ProgressTracker::new(on_progress);
 
     if context.chunks.len() > 1 {
-        return analyze_multi_chunk_map_reduce(provider, &context, input_budget).await;
+        return analyze_multi_chunk_map_reduce(provider, &context, input_budget, &mut progress)
+            .await;
     }
 
     analyze_single_chunk(
@@ -336,6 +377,7 @@ for every chunk 0..last, then save_meeting_report."
         &tool_choice,
         input_budget,
         tools_overhead,
+        &mut progress,
     )
     .await
 }
@@ -344,11 +386,18 @@ async fn analyze_multi_chunk_map_reduce(
     provider: &OpenAiCompatibleProvider,
     context: &ReportContext,
     input_budget: usize,
+    progress: &mut ProgressTracker<'_>,
 ) -> Result<MarkdownSections, AiError> {
     let map_system = map_system_prompt(&context.output_language);
     let total = context.chunks.len();
     let mut notes = Vec::with_capacity(total);
     for (idx, chunk) in context.chunks.iter().enumerate() {
+        // Map chunks span 5..=80% monotonically across the N chunks.
+        let start_pct = 5 + ((75 * idx) / total) as u8;
+        progress.emit(
+            start_pct,
+            format!("Analizando bloque {} de {}…", idx + 1, total),
+        );
         let user = format!("Chunk {} of {}:\n\n{}", idx + 1, total, chunk);
         let reply = provider
             .chat_complete(&[
@@ -360,7 +409,14 @@ async fn analyze_multi_chunk_map_reduce(
         if !trimmed.is_empty() {
             notes.push(format!("### Chunk {}/{}\n{}", idx + 1, total, trimmed));
         }
+        let done_pct = 5 + ((75 * (idx + 1)) / total) as u8;
+        progress.emit(
+            done_pct,
+            format!("Bloque {} de {} analizado…", idx + 1, total),
+        );
     }
+
+    progress.emit(85, "Sintetizando el informe final…");
 
     let tools = vec![save_report_tool()];
     let tool_choice = json!("auto");
@@ -457,7 +513,10 @@ async fn analyze_multi_chunk_map_reduce(
     }
 
     match gathered {
-        Some(sections) if !sections.is_empty() => Ok(sections),
+        Some(sections) if !sections.is_empty() => {
+            progress.emit(100, "Análisis completado.");
+            Ok(sections)
+        }
         _ => Err(AiError::InvalidResponse(
             last_error.unwrap_or_else(|| NO_REPORT_MESSAGE.to_string()),
         )),
@@ -474,6 +533,7 @@ async fn analyze_single_chunk(
     tool_choice: &Value,
     input_budget: usize,
     tools_overhead: usize,
+    progress: &mut ProgressTracker<'_>,
 ) -> Result<MarkdownSections, AiError> {
     let history_budget = input_budget.saturating_sub(tools_overhead);
     let max_rounds = (context.chunks.len() + 8).clamp(MAX_ROUNDS, MAX_ROUND_CAP);
@@ -487,6 +547,9 @@ async fn analyze_single_chunk(
     let mut save_retried = false;
     let mut gathered: Option<MarkdownSections> = None;
     let mut last_error: Option<String> = None;
+
+    // Single-chunk fixed steps: 10% start -> 30% context -> 60% transcript -> 100% saved.
+    progress.emit(10, "Preparando análisis con IA…");
 
     for _round in 0..max_rounds {
         trim_history(&mut history, history_budget);
@@ -515,6 +578,11 @@ async fn analyze_single_chunk(
                         gathered = Some(sections);
                     }
                     break;
+                }
+                match name.as_str() {
+                    READ_CONTEXT_TOOL_NAME => progress.emit(30, "Leyendo instrucciones del reporte…"),
+                    READ_TRANSCRIPT_TOOL_NAME => progress.emit(60, "Analizando transcripción…"),
+                    _ => {}
                 }
                 let id = call.get("id").cloned().unwrap_or(Value::Null);
                 let result = context.call(&name, &args);
@@ -573,6 +641,11 @@ async fn analyze_single_chunk(
             .calls
             .iter()
             .map(|call| {
+                match call.name.as_str() {
+                    READ_CONTEXT_TOOL_NAME => progress.emit(30, "Leyendo instrucciones del reporte…"),
+                    READ_TRANSCRIPT_TOOL_NAME => progress.emit(60, "Analizando transcripción…"),
+                    _ => {}
+                }
                 let text = context.call(&call.name, &call.arguments);
                 format!("- {} -> \"{}\"", call.name, clip(&text, MAX_TOOL_RESULT_CHARS))
             })
@@ -584,7 +657,10 @@ async fn analyze_single_chunk(
     }
 
     match gathered {
-        Some(sections) if !sections.is_empty() => Ok(sections),
+        Some(sections) if !sections.is_empty() => {
+            progress.emit(100, "Análisis completado.");
+            Ok(sections)
+        }
         _ => Err(AiError::InvalidResponse(
             last_error.unwrap_or_else(|| NO_REPORT_MESSAGE.to_string()),
         )),
@@ -710,7 +786,7 @@ mod tests {
         let server = MockServer::start().await;
         serve(&server, vec![reply(&save_call("- resumen"), "stop")]).await;
 
-        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", "")
+        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", "", None)
             .await
             .unwrap();
 
@@ -730,7 +806,7 @@ mod tests {
         )
         .await;
 
-        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", "")
+        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", "", None)
             .await
             .unwrap();
 
@@ -747,7 +823,7 @@ mod tests {
         )
         .await;
 
-        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", "")
+        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", "", None)
             .await
             .unwrap();
 
@@ -768,7 +844,7 @@ mod tests {
         )
         .await;
 
-        let error = analyze_transcript(&provider(&server), &meeting(), "Spanish", "")
+        let error = analyze_transcript(&provider(&server), &meeting(), "Spanish", "", None)
             .await
             .unwrap_err();
 
@@ -809,7 +885,7 @@ mod tests {
         )
         .await;
 
-        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", "")
+        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", "", None)
             .await
             .unwrap();
 
@@ -832,7 +908,7 @@ mod tests {
         )
         .await;
 
-        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", "")
+        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", "", None)
             .await
             .unwrap();
 
@@ -848,7 +924,7 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let server = MockServer::start().await;
-                analyze_transcript(&provider(&server), "hola", "Spanish", "")
+                analyze_transcript(&provider(&server), "hola", "Spanish", "", None)
                     .await
                     .unwrap()
             });
@@ -954,7 +1030,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let sections = analyze_transcript(&provider(&server), &long_meeting, "Spanish", "")
+        let sections = analyze_transcript(&provider(&server), &long_meeting, "Spanish", "", None)
             .await
             .unwrap();
 
@@ -980,7 +1056,7 @@ mod tests {
         )
         .await;
 
-        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", "")
+        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", "", None)
             .await
             .unwrap();
 
@@ -1003,7 +1079,7 @@ mod tests {
         )
         .await;
 
-        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", &long_skill)
+        let sections = analyze_transcript(&provider(&server), &meeting(), "Spanish", &long_skill, None)
             .await
             .unwrap();
         assert_eq!(sections.executive_summary, "Resumen completo.");
@@ -1022,5 +1098,70 @@ mod tests {
             last_user.contains("SKILL_END"),
             "plain-text fallback truncated the skill prompt: {last_user}"
         );
+    }
+
+    #[tokio::test]
+    async fn single_chunk_reports_monotonic_progress_ending_at_100() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            vec![
+                tool_reply(READ_CONTEXT_TOOL_NAME, json!({})),
+                tool_reply(READ_TRANSCRIPT_TOOL_NAME, json!({ "chunk": 0 })),
+                tool_reply(SAVE_REPORT_TOOL_NAME, json!({ "executive_summary": "Resumen." })),
+            ],
+        )
+        .await;
+
+        let events = std::sync::Mutex::new(Vec::<AnalysisProgress>::new());
+        let cb = |p: AnalysisProgress| events.lock().unwrap().push(p);
+        analyze_transcript(&provider(&server), &meeting(), "Spanish", "", Some(&cb))
+            .await
+            .unwrap();
+
+        let recorded = events.into_inner().unwrap();
+        assert!(recorded.len() >= 3, "expected multiple progress updates, got {recorded:?}");
+        for pair in recorded.windows(2) {
+            assert!(pair[0].percent <= pair[1].percent, "non-monotonic: {recorded:?}");
+        }
+        assert_eq!(recorded.last().unwrap().percent, 100, "{recorded:?}");
+    }
+
+    #[tokio::test]
+    async fn multi_chunk_reports_monotonic_progress_ending_at_100() {
+        let long_meeting = (0..220)
+            .map(|i| {
+                format!(
+                    "[15:{:02}:00] Turno {i}: explicacion detallada del flujo de base completa y predictivo.",
+                    i % 60
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            vec![
+                reply("Notas bloque 1", "stop"),
+                reply("Notas bloque 2", "stop"),
+                reply("Notas bloque 3", "stop"),
+                tool_reply(SAVE_REPORT_TOOL_NAME, json!({ "executive_summary": "Resumen." })),
+            ],
+        )
+        .await;
+
+        let events = std::sync::Mutex::new(Vec::<AnalysisProgress>::new());
+        let cb = |p: AnalysisProgress| events.lock().unwrap().push(p);
+        analyze_transcript(&provider(&server), &long_meeting, "Spanish", "", Some(&cb))
+            .await
+            .unwrap();
+
+        let recorded = events.into_inner().unwrap();
+        assert!(recorded.len() >= 5, "expected per-chunk + reduce + final updates, got {recorded:?}");
+        for pair in recorded.windows(2) {
+            assert!(pair[0].percent <= pair[1].percent, "non-monotonic: {recorded:?}");
+        }
+        assert_eq!(recorded.last().unwrap().percent, 100, "{recorded:?}");
     }
 }

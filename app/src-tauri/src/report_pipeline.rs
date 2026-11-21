@@ -204,11 +204,17 @@ pub async fn run_post_meeting_report(app: &AppHandle, file_path: &str) -> Result
     let prepared = prepare_transcript(&raw, &settings);
 
     if is_short_meeting(&prepared, settings.min_report_words) {
-        return write_report(&path, &short_meeting_report(&settings, &prepared.original));
+        write_report(&path, &short_meeting_report(&settings, &prepared.original))?;
+        emit_ai_progress(app, "done", "Informe guardado.", Some(100));
+        return Ok(());
     }
 
     match generate_ai_report(app, &settings, &prepared).await {
-        Ok(markdown) => write_report(&path, &markdown),
+        Ok(markdown) => {
+            write_report(&path, &markdown)?;
+            emit_ai_progress(app, "done", "Informe guardado.", Some(100));
+            Ok(())
+        }
         Err(reason) => Err(record_ai_failure(&path, &prepared.original, &reason)),
     }
 }
@@ -223,18 +229,25 @@ async fn generate_ai_report(
     let config = match settings.ai_source {
         AiSource::Api => api_model_config(settings)?,
         AiSource::Local => {
+            emit_ai_progress(app, "prepare", "Iniciando servidor de IA local…", None);
             let endpoint = ensure_local_server(app, settings).await?;
             let suggested = load_local_suggested_config(&endpoint.model_path);
             local_model_config(settings, &endpoint, &suggested)
         }
     };
     let provider = OpenAiCompatibleProvider::new(config).map_err(|err| err.to_string())?;
-    emit_ai_progress(app, "analyze", "Analizando la reunión con IA…");
+    emit_ai_progress(app, "analyze", "Analizando la reunión con IA…", Some(5));
+    let on_progress = |progress: mt_ai::AnalysisProgress| {
+        // Map pipeline 0..=100 into 5..=90 so 95..=100 remain for assembling and writing.
+        let mapped = 5 + ((u16::from(progress.percent) * 85) / 100) as u8;
+        emit_ai_progress(app, "analyze", &progress.message, Some(mapped));
+    };
     let sections = match analyze_transcript(
         &provider,
         &prepared.cleaned,
         &settings.output_language,
         &settings.report_skill_prompt,
+        Some(&on_progress),
     )
     .await
     {
@@ -246,7 +259,7 @@ async fn generate_ai_report(
         }
         Err(err) => return Err(err.to_string()),
     };
-    emit_ai_progress(app, "write", "Guardando el informe en la nota…");
+    emit_ai_progress(app, "write", "Guardando el informe en la nota…", Some(95));
     Ok(assemble_markdown_report(
         &settings.output_language,
         &sections,
@@ -968,10 +981,28 @@ fn is_shared_library(name: &str) -> bool {
 /// Progress line for the report run, shown live in the session and in the "analyze a file" card.
 const REPORT_PROGRESS_EVENT: &str = "report-progress";
 
-fn emit_ai_progress(app: &AppHandle, phase: &'static str, message: &str) {
+fn ai_progress_payload(
+    phase: &'static str,
+    message: &str,
+    percent: Option<u8>,
+) -> serde_json::Value {
+    match percent {
+        Some(pct) => serde_json::json!({
+            "phase": phase,
+            "message": message,
+            "percent": pct.min(100),
+        }),
+        None => serde_json::json!({
+            "phase": phase,
+            "message": message,
+        }),
+    }
+}
+
+fn emit_ai_progress(app: &AppHandle, phase: &'static str, message: &str, percent: Option<u8>) {
     let _ = app.emit(
         REPORT_PROGRESS_EVENT,
-        serde_json::json!({ "phase": phase, "message": message }),
+        ai_progress_payload(phase, message, percent),
     );
 }
 
@@ -1723,5 +1754,21 @@ mod tests {
         assert!(find_file(dir.path(), LLAMA_SERVER_EXE, 2).is_some());
         assert!(find_file(dir.path(), "only-deep", 1).is_none());
         assert!(find_file(dir.path(), "only-deep", 3).is_some());
+    }
+
+    #[test]
+    fn ai_progress_payload_serializes_percent_when_present_and_omits_when_absent() {
+        let with_pct = ai_progress_payload("analyze", "Analizando…", Some(42));
+        assert_eq!(with_pct["phase"], "analyze");
+        assert_eq!(with_pct["message"], "Analizando…");
+        assert_eq!(with_pct["percent"], 42);
+
+        let clamped = ai_progress_payload("done", "Listo", Some(150));
+        assert_eq!(clamped["percent"], 100);
+
+        let without_pct = ai_progress_payload("prepare", "Iniciando…", None);
+        assert_eq!(without_pct["phase"], "prepare");
+        assert_eq!(without_pct["message"], "Iniciando…");
+        assert!(without_pct.get("percent").is_none(), "{without_pct}");
     }
 }

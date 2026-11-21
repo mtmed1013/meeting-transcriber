@@ -67,6 +67,7 @@
             </div>
             <div class="ui-row ui-row--stack">
               <span class="ui-status" id="sessionMessage" role="status" aria-live="polite"></span>
+              <div class="ui-progress" id="sessionAiProgress" aria-hidden="true" hidden><div id="sessionAiProgressBar"></div></div>
               <span class="ui-status ui-status--error" id="actionError" role="alert"></span>
               <div class="ui-actions">
                 <button class="ui-btn ui-btn--primary" type="button" id="primaryBtn">Iniciar transcripción</button>
@@ -88,9 +89,12 @@
                 <button class="ui-btn ui-btn--primary" type="button" id="analyzeRun" disabled>Analizar con IA</button>
               </div>
             </div>
-            <div class="ui-row">
-              <span class="ui-status" id="analyzeStatus" role="status" aria-live="polite"></span>
-              <button class="ui-btn" type="button" id="analyzeOpen" hidden>Abrir nota</button>
+            <div class="ui-row ui-row--stack">
+              <div class="ui-progress" id="analyzeProgress" aria-hidden="true" hidden><div id="analyzeProgressBar"></div></div>
+              <div class="ui-actions" style="justify-content: space-between; width: 100%;">
+                <span class="ui-status" id="analyzeStatus" role="status" aria-live="polite"></span>
+                <button class="ui-btn" type="button" id="analyzeOpen" hidden>Abrir nota</button>
+              </div>
             </div>
           </section>
 
@@ -594,6 +598,27 @@
           rerun.disabled = state.busy.rerun || state.busy.action;
         }
 
+        function setProgressBar(wrapId, barId, percent) {
+          var wrap = $(wrapId);
+          var bar = $(barId);
+          wrap.hidden = false;
+          if (typeof percent === "number" && isFinite(percent)) {
+            wrap.classList.remove("ui-progress--indeterminate");
+            bar.style.width = Math.max(0, Math.min(100, percent)) + "%";
+          } else {
+            wrap.classList.add("ui-progress--indeterminate");
+            bar.style.width = "";
+          }
+        }
+
+        function resetProgressBar(wrapId, barId) {
+          var wrap = $(wrapId);
+          var bar = $(barId);
+          wrap.hidden = true;
+          wrap.classList.remove("ui-progress--indeterminate");
+          bar.style.width = "";
+        }
+
         function renderSession() {
           var s = state.snapshot;
           var phase = currentPhase();
@@ -604,6 +629,11 @@
           $("sessionBlocks").textContent = String(Number(s.blocksSaved) || 0);
           $("sessionLast").textContent = s.lastTimestamp ? String(s.lastTimestamp) : "—";
           setStatus($("sessionMessage"), s.message || info.text, info.tone);
+          if (phase === "analyzing_ai" || state.busy.rerun) {
+            if ($("sessionAiProgress").hidden) setProgressBar("sessionAiProgress", "sessionAiProgressBar", null);
+          } else {
+            resetProgressBar("sessionAiProgress", "sessionAiProgressBar");
+          }
           renderPrimary(phase);
           renderSecondary(phase);
           renderTimer();
@@ -650,6 +680,7 @@
           if (!path || state.busy.rerun || currentPhase() !== "done") return;
           state.busy.rerun = true;
           setStatus($("actionError"), "Re-analizando con IA…", "");
+          setProgressBar("sessionAiProgress", "sessionAiProgressBar", null);
           renderSession();
           try {
             await M.invoke("run_report_on_file", { path: path });
@@ -658,6 +689,7 @@
             showActionError("No se pudo re-analizar: " + errText(e));
           } finally {
             state.busy.rerun = false;
+            resetProgressBar("sessionAiProgress", "sessionAiProgressBar");
             renderSession();
           }
         }
@@ -1606,6 +1638,7 @@
           state.busy.analyze = true;
           $("analyzeOpen").hidden = true;
           setStatus($("analyzeStatus"), "Analizando…", "");
+          setProgressBar("analyzeProgress", "analyzeProgressBar", null);
           renderAnalyze();
           try {
             await M.invoke("run_report_on_file", { path: state.analyzePath });
@@ -1615,6 +1648,7 @@
             setStatus($("analyzeStatus"), errText(e), "error");
           } finally {
             state.busy.analyze = false;
+            resetProgressBar("analyzeProgress", "analyzeProgressBar");
             renderAnalyze();
           }
         }
@@ -1643,7 +1677,27 @@
         $("analyzeOpen").addEventListener("click", openAnalyzedNote);
         M.listen("report-progress", function (event) {
           var p = event.payload || {};
-          if (state.busy.analyze && p.message) setStatus($("analyzeStatus"), p.message, "");
+          var hasPct = typeof p.percent === "number" && isFinite(p.percent);
+          var pct = hasPct ? Math.max(0, Math.min(100, Math.round(p.percent))) : null;
+          var label = p.message || "";
+          if (hasPct) label = (label ? label + " " : "") + pct + "%";
+
+          if (state.busy.analyze) {
+            if (label) setStatus($("analyzeStatus"), label, "");
+            setProgressBar("analyzeProgress", "analyzeProgressBar", pct);
+            return;
+          }
+          if (p.phase === "done") {
+            resetProgressBar("sessionAiProgress", "sessionAiProgressBar");
+            return;
+          }
+          if (state.busy.rerun) {
+            if (label) setStatus($("actionError"), label, "");
+            setProgressBar("sessionAiProgress", "sessionAiProgressBar", pct);
+            return;
+          }
+          if (label) setStatus($("sessionMessage"), label, "");
+          setProgressBar("sessionAiProgress", "sessionAiProgressBar", pct);
         });
 
         $("pickOutputDir").addEventListener("click", async function () {
